@@ -134,11 +134,22 @@ func (uc *TrustUsecase) computeScore(ctx context.Context, actorID, actorType str
 	}
 
 	if actorType == "MERCHANT" {
-		// This is a heuristic check — we use the 90-day window count for the
-		// most frequently seen recipient. Full implementation requires a
-		// GROUP BY query; here we surface it as a known TODO for the first
-		// release — the signal will be emitted manually by a dispatcher review.
-		_ = actorType 
+		windowStart := time.Now().UTC().AddDate(0, 0, -90)
+		maxDeliveries, err := uc.trustRepo.MaxDeliveriesToSingleRecipient(ctx, actorID, windowStart)
+		if err != nil {
+			uc.log.Warn("computeScore: MaxDeliveriesToSingleRecipient failed",
+				slog.String("actor_id", actorID),
+				slog.String("reason", err.Error()),
+			)
+		} else {
+			// Phantom cargo scam heuristic: if a merchant sends many orders to the same phone
+			// in 90 days, we reduce their score.
+			if maxDeliveries > 20 {
+				score -= 0.3
+			} else if maxDeliveries > 10 {
+				score -= 0.1
+			}
+		}
 	}
 
 	if score < 0 {

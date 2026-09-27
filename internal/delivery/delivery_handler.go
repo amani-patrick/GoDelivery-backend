@@ -287,13 +287,13 @@ func (h *Handler) resolveConfirmPickup(ctx context.Context, vars map[string]any)
 	// (used by legacy client versions that don't have a scale).
 	confirmedWeightKg := float64From(vars, "confirmedWeightKg")
 
-	if Pickup(ctx, deliveryID, driverID, scannedToken, confirmedWeightKg); err != nil {
+	if err := h.deliveryUC.ConfirmPickup(ctx, deliveryID, driverID, scannedToken, confirmedWeightKg); err != nil {
 		h.log.Warn("ConfirmPickup failed",
 			slog.String("delivery_id", deliveryID),
 			slog.String("driver_id", driverID),
 			slog.String("reason", err.Error()),
 		)
-		return nil, errerr := h.deliveryUC.Confirm
+		return nil, err
 	}
 	return h.fetchAndMarshal(ctx, deliveryID)
 }

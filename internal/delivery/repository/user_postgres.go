@@ -205,7 +205,7 @@ func (r *DriverProfilePostgresRepo) GetByUserID(ctx context.Context, userID stri
 }
 
 // SetOnlineStatus flips is_online. Called when a driver opens/closes the app
-// and by TelemetryHandler on WebSocket disconnect (task 3 — phantom online fix).
+// and by TelemetryHandler on WebSocket disconnect — phantom online fix).
 func (r *DriverProfilePostgresRepo) SetOnlineStatus(ctx context.Context, userID string, online bool) error {
 	const q = `UPDATE driver_profiles SET is_online = $2 WHERE user_id = $1`
 	tag, err := r.pool.Exec(ctx, q, userID, online)
@@ -257,7 +257,7 @@ func (r *DriverProfilePostgresRepo) SetOnTrip(ctx context.Context, userID string
 	return nil
 }
 
-// UpdateRating applies the Bayesian rolling average result (task 6).
+// UpdateRating applies the Bayesian rolling average result .
 func (r *DriverProfilePostgresRepo) UpdateRating(ctx context.Context, userID string, newRating float64, newTotal int) error {
 	const q = `UPDATE driver_profiles SET rating = $2, total_deliveries = $3 WHERE user_id = $1`
 	tag, err := r.pool.Exec(ctx, q, userID, newRating, newTotal)
@@ -274,7 +274,7 @@ func (r *DriverProfilePostgresRepo) UpdateRating(ctx context.Context, userID str
 	return nil
 }
 
-// UpdateTrustScore persists a recalculated trust score and TrustLevel (task 9).
+// UpdateTrustScore persists a recalculated trust score and TrustLevel .
 func (r *DriverProfilePostgresRepo) UpdateTrustScore(ctx context.Context, userID string, score float64, level domain.TrustLevel) error {
 	const q = `UPDATE driver_profiles SET trust_score = $2, trust_level = $3 WHERE user_id = $1`
 	_, err := r.pool.Exec(ctx, q, userID, score, string(level))

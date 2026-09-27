@@ -36,7 +36,17 @@ import (
 	"github.com/umurinzi/backend/internal/ledger"
 	"github.com/umurinzi/backend/internal/matching"
 	"github.com/umurinzi/backend/internal/middleware"
+	"github.com/umurinzi/backend/internal/pricing"
+	"github.com/umurinzi/backend/internal/surge"
 	"github.com/umurinzi/backend/internal/tracking"
+)
+
+// decayInterval controls how often the danger zone threat level is reduced.
+// Every tick subtracts decayAmount from each zone. Zones that drop to 0 are
+// automatically deleted, resetting that area to safe.
+const (
+	safetyDecayInterval = 1 * time.Hour
+	safetyDecayAmount   = 0.05 // threat drops from 1.0→0 in ~20 hours of no incidents
 )
 
 func main() {
@@ -105,6 +115,9 @@ func main() {
 	alertCh     := make(chan domain.AnomalyAlert, tracking.AlertChannelSize)
 	spatialIndex := tracking.NewSpatialIndex(rdb, log)
 
+	// Safety repository (PostGIS-backed danger zones + safe hubs).
+	safetyRepo := tracking.NewSafetyPostgresRepo(pool, log)
+
 	anomalyThresholds := domain.AnomalyThresholds{
 		StationaryMinutes:    cfg.Anomaly.StationaryMinutes,
 		RouteDeviationMeters: cfg.Anomaly.RouteDeviationMeters,
@@ -113,7 +126,7 @@ func main() {
 	anomalyDetector := tracking.NewAnomalyDetector(spatialIndex, anomalyThresholds, alertCh, log)
 
 	// driverRepo satisfies tracking.DriverPresenceNotifier (has SetOnlineStatus).
-	// This lets TelemetryHandler force drivers offline on WebSocket close (task 3).
+	// This lets TelemetryHandler force drivers offline on WebSocket close .
 	telemetryHandler := tracking.NewTelemetryHandler(
 		spatialIndex, anomalyDetector, auditLedger, driverRepo, log,
 	)
@@ -158,6 +171,9 @@ func main() {
 	matchEngine := matching.NewEngine(osrmClient, spatialIndex, driverRepo, userRepo, rdb, matchCfg, log)
 	matchResultCh := make(chan []domain.MatchResult, 256)
 
+	// Surge Pricing Engine (feature #7)
+	surgeEngine := surge.NewEngine(pool, log)
+
 	// ── 8. Application usecases ───────────────────────────────────────────────
 	authCfg := deliveryuc.AuthConfig{
 		JWTSecret:   cfg.Auth.JWTSecret,
@@ -174,20 +190,24 @@ func main() {
 	trustUC := deliveryuc.NewTrustUsecase(
 		trustRepo, driverRepo, businessRepo, customerRepo, log,
 	)
-	_ = trustUC // available for dispatcher-triggered recomputation via handler (future route)
+	_ = trustUC
 
 	deliveryUC := deliveryuc.NewDeliveryUsecase(
 		deliveryRepo,
 		driverRepo,
 		outboxRepo,
 		trustRepo,
+		userRepo,
+		safetyRepo,
+		pricing.NewEngine(surgeEngine),
 		auditLedger,
 		rdb,
 		pool,
 		cfg.Auth.BcryptCost,
-		driverUC.EnqueueForDispatch,         // dispatch enqueuer (task 4 / batch)
-		matchEngine.ClearPending,             // clear re-dispatch key on accept (task 1)
-		matchEngine.GetIntendedDriver,        // concurrent acceptance guard (task 2)
+		driverUC.EnqueueForDispatch,         // dispatch enqueuer 
+		matchEngine.ClearPending,             // clear re-dispatch key on accept 
+		matchEngine.GetIntendedDriver,        // concurrent acceptance guard 
+		osrmClient,                           // osrm client for pin snapping
 		log,
 	)
 
@@ -224,7 +244,7 @@ func main() {
 	// Matching batch loop — drains Redis queue every BatchWindowMs.
 	go matchEngine.RunBatchLoop(bgCtx, matchResultCh)
 
-	// Re-dispatch timeout scanner — scans for expired pending keys (task 1).
+	// Re-dispatch timeout scanner — scans for expired pending keys .
 	// The redispatch alert channel is shared with the regular alertCh so
 	// BroadcastAlert reaches the driver's WebSocket connection.
 	go matchEngine.RunRedispatchLoop(bgCtx, alertCh)
@@ -232,7 +252,7 @@ func main() {
 	// Match result consumer — pushes DISPATCH WebSocket notifications to winners.
 	go runMatchResultConsumer(bgCtx, matchResultCh, telemetryHandler, log)
 
-	// Heartbeat scanner — forces phantom-online drivers offline (task 3).
+	// Heartbeat scanner — forces phantom-online drivers offline .
 	go spatialIndex.RunHeartbeatScanner(bgCtx, func(hbCtx context.Context, driverID string) {
 		if err := driverRepo.SetOnlineStatus(hbCtx, driverID, false); err != nil {
 			log.Warn("heartbeat scanner: SetOnlineStatus failed",
@@ -240,6 +260,20 @@ func main() {
 				slog.String("reason", err.Error()),
 			)
 		}
+	})
+
+	// Safety decay loop — decays danger zone threat levels hourly.
+	// Zones whose threat level drops to 0 are automatically deleted (area becomes safe).
+	go runSafetyDecayLoop(bgCtx, safetyRepo, log)
+
+	// Surge Pricing demand sampler loop (feature #7).
+	go surgeEngine.RunLoop(bgCtx, func(ctx context.Context) int {
+		// To avoid circular dependencies, we run a direct count query.
+		var count int
+		_ = pool.QueryRow(ctx, "SELECT COUNT(*) FROM deliveries WHERE current_state = 'CREATED' OR current_state = 'DISPATCHED'").Scan(&count)
+		return count
+	}, func(ctx context.Context) int {
+		return spatialIndex.OnlineCount()
 	})
 
 	// ── 11. HTTP server ───────────────────────────────────────────────────────
@@ -279,7 +313,29 @@ func main() {
 	log.Info("server stopped cleanly")
 }
 
-// ── Background helpers ────────────────────────────────────────────────────────
+func runSafetyDecayLoop(ctx context.Context, repo domain.SafetyRepository, log *slog.Logger) {
+	ticker := time.NewTicker(safetyDecayInterval)
+	defer ticker.Stop()
+	log.Info("safety decay loop started",
+		slog.Duration("interval", safetyDecayInterval),
+		slog.Float64("decay_per_tick", safetyDecayAmount),
+	)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("safety decay loop stopped")
+			return
+		case <-ticker.C:
+			if err := repo.DecayThreatLevels(ctx, safetyDecayAmount); err != nil {
+				log.Error("safety decay: DecayThreatLevels failed",
+					slog.String("reason", err.Error()),
+				)
+			} else {
+				log.Info("safety decay: threat levels updated")
+			}
+		}
+	}
+}
 
 // runMatchResultConsumer drains the matchResultCh and broadcasts DISPATCH
 // alerts to matched drivers over their active WebSocket connections.

@@ -3,19 +3,19 @@
 -- Adds four columns to the deliveries table:
 --
 --   confirmed_weight_kg  — physical weight confirmed by the driver at pickup
---                          (task 5 — weight fraud guard).
+-— weight fraud guard).
 --                          0 means not yet confirmed.
 --
 --   priority_level       — 0 = standard, 1 = priority, 2 = premium.
 --                          Premium orders bypass stacking and get a score boost
---                          (task 7).
+-.
 --
 --   stack_group_id       — UUID shared across all deliveries in a stacked route.
 --                          NULL for solo deliveries.
 --
 --   stack_sequence       — position of this delivery within the stacked route.
 --                          0 = solo, 1 = first drop, 2 = second drop, etc.
---                          (task 4 — order stacking).
+-— order stacking).
 
 BEGIN;
 
@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS deliveries_priority_idx
     ON deliveries (priority_level, current_state)
     WHERE priority_level > 0;
 
--- trust_signals table (task 9) — append-only fraud event log for all actor types
+-- trust_signals table  — append-only fraud event log for all actor types
 CREATE TABLE IF NOT EXISTS trust_signals (
     id          TEXT        NOT NULL,
     actor_id    TEXT        NOT NULL,
@@ -64,7 +64,7 @@ CREATE INDEX IF NOT EXISTS trust_signals_actor_idx
 CREATE INDEX IF NOT EXISTS trust_signals_type_idx
     ON trust_signals (signal_type, created_at DESC);
 
--- trust_score columns on all three profile tables (task 9)
+-- trust_score columns on all three profile tables 
 ALTER TABLE driver_profiles
     ADD COLUMN IF NOT EXISTS trust_score DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     ADD COLUMN IF NOT EXISTS trust_level TEXT             NOT NULL DEFAULT 'GOOD';

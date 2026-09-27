@@ -30,6 +30,18 @@ var (
 )
 
 
+type ErrDangerZone struct {
+	NearestSafeHub *SafeHub
+}
+
+func (e *ErrDangerZone) Error() string {
+	if e.NearestSafeHub != nil {
+		return "dropoff location is in an active danger zone — nearest safe hub: " + e.NearestSafeHub.Name
+	}
+	return "dropoff location is in an active danger zone"
+}
+
+
 // Location is an immutable geographic coordinate pair.
 // It is a value object: equality is structural, it has no identity.
 type Location struct {

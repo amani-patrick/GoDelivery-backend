@@ -290,7 +290,7 @@ func (r *DeliveryPostgresRepo) ListActiveByDriver(ctx context.Context, driverID 
 }
 
 // UpdateConfirmedWeight sets the confirmed_weight_kg field after the driver
-// physically weighs the package at pickup (task 5 — weight fraud guard).
+// physically weighs the package at pickup — weight fraud guard).
 func (r *DeliveryPostgresRepo) UpdateConfirmedWeight(ctx context.Context, deliveryID string, confirmedKg float64) error {
 	const q = `UPDATE deliveries SET confirmed_weight_kg = $2, updated_at = NOW() WHERE id = $1`
 	tag, err := r.pool.Exec(ctx, q, deliveryID, confirmedKg)
@@ -308,7 +308,7 @@ func (r *DeliveryPostgresRepo) UpdateConfirmedWeight(ctx context.Context, delive
 }
 
 // UpdateStackInfo writes the stack_group_id and stack_sequence after the
-// matching engine approves a multi-drop stacking arrangement (task 4).
+// matching engine approves a multi-drop stacking arrangement .
 func (r *DeliveryPostgresRepo) UpdateStackInfo(ctx context.Context, deliveryID, stackGroupID string, sequence int) error {
 	const q = `UPDATE deliveries SET stack_group_id = $2, stack_sequence = $3, updated_at = NOW() WHERE id = $1`
 	tag, err := r.pool.Exec(ctx, q, deliveryID, nullableString(stackGroupID), sequence)

@@ -185,7 +185,7 @@ type BusinessProfile struct {
 type CustomerProfile struct {
 	UserID        string     `json:"user_id"`
 	SavedLocation Location   `json:"saved_location,omitempty"`
-	TrustScore    float64    `json:"trust_score"` // task 9
+	TrustScore    float64    `json:"trust_score"` // 
 	TrustLevel    TrustLevel `json:"trust_level"`
 }
 
@@ -232,10 +232,10 @@ type DriverProfileRepository interface {
 	) ([]*DriverProfile, error)
 
 	// UpdateRating updates the rating and total_deliveries using Bayesian rolling
-	// average after a delivery is confirmed (task 6).
+	// average after a delivery is confirmed .
 	UpdateRating(ctx context.Context, userID string, newRating float64, newTotal int) error
 
-	// UpdateTrustScore persists a recalculated trust score and level (task 9).
+	// UpdateTrustScore persists a recalculated trust score and level .
 	UpdateTrustScore(ctx context.Context, userID string, score float64, level TrustLevel) error
 }
 
@@ -244,19 +244,20 @@ type BusinessProfileRepository interface {
 	Upsert(ctx context.Context, p *BusinessProfile) error
 	GetByUserID(ctx context.Context, userID string) (*BusinessProfile, error)
 	SetVerified(ctx context.Context, userID string, verified bool) error
-	UpdateTrustScore(ctx context.Context, userID string, score float64, level TrustLevel) error // task 9
+	UpdateTrustScore(ctx context.Context, userID string, score float64, level TrustLevel) error // 
 }
 
 // CustomerProfileRepository is the persistence contract for CustomerProfile.
 type CustomerProfileRepository interface {
 	Upsert(ctx context.Context, p *CustomerProfile) error
 	GetByUserID(ctx context.Context, userID string) (*CustomerProfile, error)
-	UpdateTrustScore(ctx context.Context, userID string, score float64, level TrustLevel) error // task 9
+	UpdateTrustScore(ctx context.Context, userID string, score float64, level TrustLevel) error // 
 }
 
-// TrustRepository persists fraud signals for all actor types (task 9).
+// TrustRepository persists fraud signals for all actor types .
 type TrustRepository interface {
 	AppendSignal(ctx context.Context, signal *TrustSignal) error
 	CountSignals(ctx context.Context, actorID, signalType string, since time.Time) (int, error)
 	CountDeliveriesByMerchantToRecipient(ctx context.Context, merchantID, recipientPhone string) (int, error)
+	MaxDeliveriesToSingleRecipient(ctx context.Context, merchantID string, since time.Time) (int, error)
 }

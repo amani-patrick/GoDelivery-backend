@@ -19,8 +19,8 @@ import (
 
 const (
 	batchQueueKey          = "match:queue"
-	dispatchPendingPrefix  = "dispatch:pending:"  // task 1: re-dispatch timeout
-	dispatchIntendedPrefix = "dispatch:intended:"  // task 2: concurrent acceptance guard
+	dispatchPendingPrefix  = "dispatch:pending:"  // : re-dispatch timeout
+	dispatchIntendedPrefix = "dispatch:intended:"  // : concurrent acceptance guard
 	osrmFallbackSpeedKmh   = 25.0
 )
 
@@ -34,10 +34,10 @@ const (
 //   3. Heading vector check (highway-passing paradox)    — < 1 ms
 //   4. OSRM Tier-2 routing matrix (real road ETAs)       — 5–50 ms
 //   5. Deadheading guard (road dist > max → drop)        — < 1 ms
-//   6. Fuel cost calculation                             — < 1 ms  (task 8)
+//   6. Fuel cost calculation                             — < 1 ms  
 //   7. Dynamic scoring with fuel + heading + premium     — < 1 ms  (tasks 7,8)
-//   8. Re-dispatch timeout registration                  — < 1 ms  (task 1)
-//   9. Intended winner registration                      — < 1 ms  (task 2)
+//   8. Re-dispatch timeout registration                  — < 1 ms  
+//   9. Intended winner registration                      — < 1 ms  
 //  10. Rank and return
 type Engine struct {
 	osrm     *OSRMClient
@@ -125,7 +125,7 @@ func (e *Engine) Match(ctx context.Context, order domain.BatchOrder) (*domain.Ma
 		return result, nil
 	}
 
-	// Drop drivers with a BANNED trust level (task 9).
+	// Drop drivers with a BANNED trust level .
 	eligible := profiles[:0]
 	for _, p := range profiles {
 		if p.TrustLevel == domain.TrustLevelBanned {
@@ -181,7 +181,6 @@ func (e *Engine) Match(ctx context.Context, order domain.BatchOrder) (*domain.Ma
 			continue
 		}
 
-		// Stage 5: Deadhead guard
 		if roadDistKm > maxDeadhead {
 			e.log.Info("match: driver exceeds deadhead limit",
 				slog.String("driver_id", p.UserID),
@@ -191,15 +190,20 @@ func (e *Engine) Match(ctx context.Context, order domain.BatchOrder) (*domain.Ma
 			continue
 		}
 
-		// Stage 6: Fuel cost calculation (task 8)
+		if DefaultCurfew.WouldExceedCurfew(etaSec) {
+			e.log.Info("match: driver rejected due to curfew constraint",
+				slog.String("driver_id", p.UserID),
+				slog.Float64("eta_min", etaMin),
+			)
+			continue
+		}
+
 		fuelCostRWF := e.fuelCost(p.VehicleType, roadDistKm)
 
-		// Stage 7a: Base score
 		score := (etaMin * e.cfg.WeightTime) +
 			(roadDistKm * e.cfg.WeightDistance) +
 			(fuelCostRWF/1000.0 * e.cfg.WeightFuel) // normalise RWF to ~km scale
 
-		// Stage 7b: Heading penalty (highway-passing paradox)
 		penalised := false
 		hs := headingMap[p.UserID]
 		if hs.SpeedKmh >= e.cfg.HeadingPenaltyMinSpeedKmh {
@@ -214,7 +218,7 @@ func (e *Engine) Match(ctx context.Context, order domain.BatchOrder) (*domain.Ma
 			}
 		}
 
-		// Stage 7c: Premium score boost (task 7) — subtract a fixed amount so
+		// subtract a fixed amount so
 		// premium winners beat standard candidates unconditionally.
 		if order.IsPremium {
 			score -= e.cfg.PremiumScoreBoost
@@ -250,10 +254,10 @@ func (e *Engine) Match(ctx context.Context, order domain.BatchOrder) (*domain.Ma
 	result.Ranked = scored
 	result.Winner = &scored[0]
 
-	// Stage 8: Register pending dispatch with TTL for re-dispatch (task 1).
+	// Register pending dispatch with TTL for re-dispatch 
 	e.registerPending(ctx, order.DeliveryID, result)
 
-	// Stage 9: Register intended winner to block concurrent acceptance (task 2).
+	// Register intended winner to block concurrent acceptance .
 	e.registerIntended(ctx, order.DeliveryID, result.Winner.UserID)
 
 	e.log.Info("match: winner selected",
@@ -269,8 +273,6 @@ func (e *Engine) Match(ctx context.Context, order domain.BatchOrder) (*domain.Ma
 	)
 	return result, nil
 }
-
-// ── Re-dispatch timeout (task 1) ──────────────────────────────────────────────
 
 // pendingDispatch is what is stored in Redis under dispatch:pending:<deliveryID>.
 // It carries the full ranked list so re-dispatch can offer the next candidate
@@ -338,7 +340,7 @@ func (e *Engine) RedispatchExpired(ctx context.Context, deliveryID string) *doma
 	ttl := time.Duration(e.cfg.RedispatchTimeoutMs) * time.Millisecond
 	_ = e.rdb.Set(ctx, key, string(b), ttl)
 
-	// Update intended winner key (task 2).
+	// Update intended winner key .
 	e.registerIntended(ctx, deliveryID, next.UserID)
 
 	e.log.Info("RedispatchExpired: offering next candidate",
@@ -419,7 +421,7 @@ func (e *Engine) RunRedispatchLoop(ctx context.Context, alertCh chan<- domain.An
 	}
 }
 
-// ── Intended winner guard (task 2) ────────────────────────────────────────────
+// ── Intended winner guard  ────────────────────────────────────────────
 
 // registerIntended writes the intended winner driver ID to Redis with the same
 // TTL as the pending dispatch. AcceptOrder reads this key to block a different
@@ -446,7 +448,7 @@ func (e *Engine) GetIntendedDriver(ctx context.Context, deliveryID string) strin
 	return val
 }
 
-// ── Order stacking (task 4) ───────────────────────────────────────────────────
+// ── Order stacking  ───────────────────────────────────────────────────
 
 // EvaluateStack decides whether a new order can be stacked onto an ON_TRIP driver.
 //
@@ -677,7 +679,7 @@ func (e *Engine) maxDeadheadFor(vt domain.VehicleType) float64 {
 }
 
 // fuelCost calculates the deadhead fuel cost in RWF for the given vehicle
-// type and road distance to pickup. Used in the score formula (task 8).
+// type and road distance to pickup. Used in the score formula .
 func (e *Engine) fuelCost(vt domain.VehicleType, roadDistKm float64) float64 {
 	litresPerKm, ok := e.cfg.FuelLitresPerKm[vt]
 	if !ok || litresPerKm == 0 {

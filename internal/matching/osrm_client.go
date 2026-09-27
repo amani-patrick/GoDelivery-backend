@@ -147,3 +147,51 @@ func (c *OSRMClient) Table(
 	}
 	return matrix, nil
 }
+
+// ── OSRM Nearest API 
+type osrmNearestResponse struct {
+	Code      string `json:"code"`
+	Waypoints []struct {
+		Distance float64   `json:"distance"` 
+		Location []float64 `json:"location"` 
+	} `json:"waypoints"`
+}
+
+type SnapResult struct {
+	DistanceM float64  
+	SnappedLat float64 
+	SnappedLng float64 
+}
+
+
+func (c *OSRMClient) SnapToRoad(ctx context.Context, lat, lng float64) (*SnapResult, error) {
+	url := fmt.Sprintf("%s/nearest/v1/driving/%.6f,%.6f?number=1",
+		c.baseURL, lng, lat) // OSRM: lon,lat
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("osrm nearest: build request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("osrm nearest: http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return nil, fmt.Errorf("osrm nearest: status %d: %s", resp.StatusCode, body)
+	}
+	var nr osrmNearestResponse
+	if err := json.NewDecoder(resp.Body).Decode(&nr); err != nil {
+		return nil, fmt.Errorf("osrm nearest: decode: %w", err)
+	}
+	if nr.Code != "Ok" || len(nr.Waypoints) == 0 {
+		return nil, fmt.Errorf("osrm nearest: code=%q", nr.Code)
+	}
+	wp := nr.Waypoints[0]
+	result := &SnapResult{
+		DistanceM:  wp.Distance,
+		SnappedLng: wp.Location[0],
+		SnappedLat: wp.Location[1],
+	}
+	return result, nil
+}

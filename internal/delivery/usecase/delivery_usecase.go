@@ -14,7 +14,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/umurinzi/backend/internal/circuit"
 	"github.com/umurinzi/backend/internal/domain"
+	"github.com/umurinzi/backend/internal/matching"
+	"github.com/umurinzi/backend/internal/pricing"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -61,14 +64,19 @@ type DeliveryUsecase struct {
 	driverRepo       domain.DriverProfileRepository
 	outbox           domain.OutboxRepository
 	trustRepo        domain.TrustRepository    //nil when not wired
+	userRepo         domain.UserRepository
+	safetyRepo       domain.SafetyRepository
+	pricing          *pricing.Engine
 	ledger           domain.LedgerRepository
 	redisClient      *redis.Client
 	pool             *pgxpool.Pool
 	bcryptCost       int
 	dispatchEnqueuer DispatchEnqueuerFunc
-	clearPending     func(ctx context.Context, deliveryID string) 
+	clearPending     func(ctx context.Context, deliveryID string)
 	getIntended      func(ctx context.Context, deliveryID string) string
+	osrm             *matching.OSRMClient
 	log              *slog.Logger
+	cb               *circuit.Breaker
 }
 
 func NewDeliveryUsecase(
@@ -76,6 +84,9 @@ func NewDeliveryUsecase(
 	driverRepo domain.DriverProfileRepository,
 	outbox domain.OutboxRepository,
 	trustRepo domain.TrustRepository,
+	userRepo domain.UserRepository,
+	safetyRepo domain.SafetyRepository,
+	pricingEngine *pricing.Engine,
 	ledger domain.LedgerRepository,
 	redisClient *redis.Client,
 	pool *pgxpool.Pool,
@@ -83,6 +94,7 @@ func NewDeliveryUsecase(
 	dispatchEnqueuer DispatchEnqueuerFunc,
 	clearPending func(ctx context.Context, deliveryID string),
 	getIntended func(ctx context.Context, deliveryID string) string,
+	osrm *matching.OSRMClient,
 	log *slog.Logger,
 ) *DeliveryUsecase {
 	return &DeliveryUsecase{
@@ -90,6 +102,9 @@ func NewDeliveryUsecase(
 		driverRepo:       driverRepo,
 		outbox:           outbox,
 		trustRepo:        trustRepo,
+		userRepo:         userRepo,
+		safetyRepo:       safetyRepo,
+		pricing:          pricingEngine,
 		ledger:           ledger,
 		redisClient:      redisClient,
 		pool:             pool,
@@ -97,7 +112,9 @@ func NewDeliveryUsecase(
 		dispatchEnqueuer: dispatchEnqueuer,
 		clearPending:     clearPending,
 		getIntended:      getIntended,
+		osrm:             osrm,
 		log:              log,
+		cb:               circuit.New(5, 30*time.Second), // 5 failures -> Open for 30s
 	}
 }
 
@@ -113,6 +130,7 @@ type CreateDeliveryInput struct {
 	WeightKg            float64
 	VehicleTypeRequired domain.VehicleType   //empty for any type 
 	PackageCategory     domain.PackageCategory
+	IsPrepaid           bool
 	// IdempotencyKey is optional. When provided and a matching record exists in
 	// Redis, the original Delivery is returned without creating a new one.
 	// The plaintext tokens are NOT re-served on a duplicate — the caller must
@@ -127,14 +145,11 @@ type CreateDeliveryInput struct {
 // IsDuplicate is true.
 type CreateDeliveryOutput struct {
 	Delivery        *domain.Delivery
-	PlaintextQRCode string // shown to merchant ONCE for QR generation
-	PlaintextPIN    string // sent to customer ONCE via SMS / push notification
-	IsDuplicate     bool   // true when this result came from the idempotency cache
+	PlaintextQRCode string 
+	PlaintextPIN    string 
+	IsDuplicate     bool  
 }
 
-// idempotencyRecord is what we store in Redis — only the delivery ID so we
-// can re-fetch the full aggregate on a duplicate request. We deliberately
-// never cache plaintext tokens.
 type idempotencyRecord struct {
 	DeliveryID string `json:"delivery_id"`
 }
@@ -174,6 +189,56 @@ func (uc *DeliveryUsecase) CreateDelivery(
 	}
 	if in.WeightKg <= 0 {
 		return nil, fmt.Errorf("%w: weight_kg must be positive", domain.ErrInvalidInput)
+	}
+
+	if uc.safetyRepo != nil {
+		if inDanger, err := uc.safetyRepo.IsDangerZone(ctx, in.DropoffLat, in.DropoffLng); err != nil {
+			// Safety check failure is non-fatal; log and proceed to avoid blocking legitimate deliveries.
+			uc.log.Warn("CreateDelivery: danger zone check failed — proceeding",
+				slog.String("reason", err.Error()),
+			)
+		} else if inDanger {
+			hub, hubErr := uc.safetyRepo.FindNearestSafeHub(ctx, in.DropoffLat, in.DropoffLng)
+			if hubErr == nil && hub != nil {
+				uc.log.Warn("CreateDelivery: dropoff in danger zone — rejected",
+					slog.Float64("dropoff_lat", in.DropoffLat),
+					slog.Float64("dropoff_lng", in.DropoffLng),
+					slog.String("safe_hub", hub.Name),
+				)
+				return nil, &domain.ErrDangerZone{
+					NearestSafeHub: hub,
+				}
+			}
+			// No safe hub found — still block the delivery.
+			return nil, fmt.Errorf("%w: dropoff location is currently restricted for driver safety", domain.ErrInvalidInput)
+		}
+	}
+
+	// ── Feature #11: Coordinate Pin Deflection (Road Snapping) ───────────────
+	// Check if the dropoff is legitimately near a road network.
+	if uc.osrm != nil {
+		snap, err := uc.osrm.SnapToRoad(ctx, in.DropoffLat, in.DropoffLng)
+		if err == nil && snap.DistanceM > 1000 {
+			// If snapped distance is > 1km from nearest road, it's likely a river or forest.
+			uc.log.Warn("CreateDelivery: dropoff pin is too far from road network",
+				slog.Float64("distance_m", snap.DistanceM),
+				slog.Float64("lat", in.DropoffLat),
+				slog.Float64("lng", in.DropoffLng),
+			)
+			return nil, fmt.Errorf("%w: delivery location is inaccessible (no roads nearby)", domain.ErrInvalidInput)
+		}
+	}
+
+	// ── Feature #4: Ghost Order Risk Mitigation ─────────────────────────────
+	var customerRisk float64
+	riskErr := uc.pool.QueryRow(ctx, "SELECT risk_score FROM customer_risk WHERE customer_id = $1", in.CustomerID).Scan(&customerRisk)
+	if riskErr == nil && customerRisk > 3.0 && !in.IsPrepaid {
+		// High risk customer, require prepay (or micro-insurance).
+		uc.log.Warn("CreateDelivery: high-risk customer attempted COD order",
+			slog.String("customer_id", in.CustomerID),
+			slog.Float64("risk_score", customerRisk),
+		)
+		return nil, fmt.Errorf("%w: high-risk customer must pre-pay for the order", domain.ErrInvalidInput)
 	}
 
 	rawQR, err := generateSecureToken(qrTokenBytes)
@@ -628,14 +693,23 @@ func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 	// AmountRWF is 0 here — the actual fare calculation will be implemented
 	// when the pricing service is wired in. The worker will skip events with
 	// amount = 0 and re-queue them until pricing is resolved.
+	fare := uc.pricing.CalculateFare(ctx, delivery)
+	
+	recipientPhone := ""
+	if driverUser, err := uc.userRepo.GetByID(ctx, delivery.DriverID); err == nil && driverUser != nil {
+		recipientPhone = driverUser.Phone
+	} else {
+		uc.log.Warn("ConfirmDelivery: failed to fetch driver phone", slog.String("driver_id", delivery.DriverID))
+	}
+
 	idemKey := buildPaymentIdempotencyKey(delivery.ID, delivery.DriverID)
 	now := time.Now().UTC()
 	event := &domain.PaymentEvent{
 		ID:                   uuid.NewString(),
 		DeliveryID:           delivery.ID,
 		DriverID:             delivery.DriverID,
-		AmountRWF:            0, // TODO: inject fare from pricing service
-		RecipientPhone:       "", // TODO: inject from driver profile lookup
+		AmountRWF:            fare,
+		RecipientPhone:       recipientPhone,
 		OutboxIdempotencyKey: idemKey,
 		Status:               domain.PaymentPending,
 		AttemptCount:         0,
@@ -695,9 +769,110 @@ func (uc *DeliveryUsecase) RaiseDispute(ctx context.Context, deliveryID, actorID
 	return nil
 }
 
-// GetDelivery returns a single delivery by ID.
+func (uc *DeliveryUsecase) ReportRobbery(
+	ctx context.Context,
+	actorID string,
+	lat, lng float64,
+	deliveryID string,
+) error {
+	if uc.safetyRepo == nil {
+		return fmt.Errorf("safety repository not configured")
+	}
+	if err := uc.safetyRepo.ReportIncident(ctx, lat, lng); err != nil {
+		return fmt.Errorf("ReportRobbery: %w", err)
+	}
+	details := fmt.Sprintf("robbery reported at lat=%.6f lng=%.6f", lat, lng)
+	if deliveryID != "" {
+		details += " delivery_id=" + deliveryID
+	}
+	uc.appendAudit(ctx, deliveryID, actorID, "ROBBERY_REPORTED", "", "", details)
+	uc.log.Warn("robbery reported — danger zone created/bumped",
+		slog.String("actor_id", actorID),
+		slog.Float64("lat", lat),
+		slog.Float64("lng", lng),
+		slog.String("delivery_id", deliveryID),
+	)
+	return nil
+}
+
+// ReportWeightDiscrepancy 
+// A driver calls this when a merchant lies about the package weight
+// The delivery is immediately suspended, the driver is unassigned so they can move on,
+// and the merchant is penalised/fined.
+func (uc *DeliveryUsecase) ReportWeightDiscrepancy(
+	ctx context.Context,
+	deliveryID string,
+	driverID string,
+	declaredKg float64,
+	reportedKg float64,
+) error {
+	d, err := uc.repo.GetByID(ctx, deliveryID)
+	if err != nil {
+		return err
+	}
+	if d.CurrentState != domain.StateAssigned {
+		return fmt.Errorf("ReportWeightDiscrepancy: invalid state %s", d.CurrentState)
+	}
+	if d.DriverID != driverID {
+		return domain.ErrUnauthorized
+	}
+
+	prevState := d.CurrentState
+	// 1. Suspend the order (it requires manual dispatcher/merchant resolution).
+	if err := d.Transition(domain.StateDisputed, "WEIGHT_FRAUD"); err != nil {
+		return err
+	}
+	// 2. Clear the driver so they are free to accept new jobs.
+	d.DriverID = ""
+
+	if err := uc.repo.Update(ctx, d); err != nil {
+		return err
+	}
+
+	// 3. Emit a severe trust signal against the merchant. This auto-drops their score
+	// and may lead to an automatic ban.
+	uc.emitTrustSignal(ctx, d.MerchantID, "MERCHANT", domain.SignalWeightFraud, 5,
+		fmt.Sprintf("declared %.2f kg, driver reported %.2f kg", declaredKg, reportedKg))
+
+	uc.appendAudit(ctx, deliveryID, driverID, "WEIGHT_DISCREPANCY_REPORTED",
+		string(prevState), string(domain.StateDisputed),
+		fmt.Sprintf("driver reported %f kg (declared: %f)", reportedKg, declaredKg))
+
+	return nil
+}
+
+// GetDelivery returns a single delivery by ID, using a Circuit Breaker and Redis fallback (feature #8).
 func (uc *DeliveryUsecase) GetDelivery(ctx context.Context, id string) (*domain.Delivery, error) {
-	return uc.repo.GetByID(ctx, id)
+	var d *domain.Delivery
+	err := uc.cb.Execute(func() error {
+		var dbErr error
+		d, dbErr = uc.repo.GetByID(ctx, id)
+		return dbErr
+	})
+
+	if err == circuit.ErrCircuitOpen || err != nil {
+		// Circuit is open (Postgres down/slow) or normal DB query failed. 
+		// Try to serve gracefully from Redis cache.
+		cacheKey := "delivery:cache:" + id
+		raw, redisErr := uc.redisClient.Get(ctx, cacheKey).Bytes()
+		if redisErr == nil {
+			uc.log.Warn("GetDelivery: served from Redis fallback cache (circuit OPEN)", slog.String("id", id))
+			var cached domain.Delivery
+			if json.Unmarshal(raw, &cached) == nil {
+				return &cached, nil
+			}
+		}
+		// If cache misses or DB genuinely fails, return the error.
+		return nil, err
+	}
+
+	// Normal path success — update cache asynchronously.
+	go func() {
+		b, _ := json.Marshal(d)
+		uc.redisClient.Set(context.Background(), "delivery:cache:"+id, b, 5*time.Minute)
+	}()
+
+	return d, nil
 }
 
 // Returns active deliveries for a driver.

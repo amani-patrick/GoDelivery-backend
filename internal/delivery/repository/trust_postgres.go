@@ -101,3 +101,26 @@ func (r *TrustPostgresRepo) CountDeliveriesByMerchantToRecipient(
 	}
 	return count, nil
 }
+
+// MaxDeliveriesToSingleRecipient returns the maximum number of deliveries sent by a merchant to a single recipient phone number since the given time.
+func (r *TrustPostgresRepo) MaxDeliveriesToSingleRecipient(ctx context.Context, merchantID string, since time.Time) (int, error) {
+	const q = `
+		SELECT MAX(cnt) FROM (
+			SELECT COUNT(*) as cnt
+			FROM deliveries d
+			JOIN users u ON u.id = d.customer_id
+			WHERE d.merchant_id = $1
+			  AND d.created_at >= $2
+			  AND d.current_state = 'DELIVERED'
+			GROUP BY u.phone
+		) sub
+	`
+	var count *int
+	if err := r.pool.QueryRow(ctx, q, merchantID, since).Scan(&count); err != nil {
+		return 0, fmt.Errorf("max merchant-to-recipient deliveries: %w", err)
+	}
+	if count == nil {
+		return 0, nil
+	}
+	return *count, nil
+}

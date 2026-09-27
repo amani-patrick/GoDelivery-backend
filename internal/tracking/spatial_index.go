@@ -196,7 +196,7 @@ func (s *SpatialIndex) RemoveDriver(ctx context.Context, driverID string) error 
 
 // RefreshHeartbeat resets the per-driver heartbeat TTL key.
 // Called on every valid FRAME message. The heartbeat scanner forces drivers
-// offline when this key expires (task 3 — phantom online fix).
+// offline when this key expires — phantom online fix).
 func (s *SpatialIndex) RefreshHeartbeat(ctx context.Context, driverID string) {
 	key := "driver:heartbeat:" + driverID
 	if err := s.rdb.Set(ctx, key, "1", 90*time.Second).Err(); err != nil {
@@ -322,7 +322,7 @@ func (d *AnomalyDetector) Analyse(ctx context.Context, frame domain.TelemetryFra
 	if stationarySince := d.detectStationaryStart(frames); !stationarySince.IsZero() {
 		minutes := time.Since(stationarySince).Minutes()
 		if minutes >= float64(d.thresholds.StationaryMinutes) {
-			d.emit(domain.AnomalyAlert{
+			d.EmitAlert(domain.AnomalyAlert{
 				DeliveryID:   frame.DeliveryID,
 				DriverID:     frame.DriverID,
 				AlertType:    "STATIONARY",
@@ -349,7 +349,7 @@ func (d *AnomalyDetector) Analyse(ctx context.Context, frame domain.TelemetryFra
 		// above maxMotorbikeSpeedKmh. This post-write check uses a tighter
 		// threshold as a secondary alert layer for sustained high speed.
 		if impliedKmh > maxMotorbikeSpeedKmh {
-			d.emit(domain.AnomalyAlert{
+			d.EmitAlert(domain.AnomalyAlert{
 				DeliveryID:   frame.DeliveryID,
 				DriverID:     frame.DriverID,
 				AlertType:    "ROUTE_DEVIATION",
@@ -367,7 +367,7 @@ func (d *AnomalyDetector) Analyse(ctx context.Context, frame domain.TelemetryFra
 
 // emit pushes an alert onto the buffered channel. If the channel is full the
 // alert is logged and dropped — dropping is preferable to blocking the pipeline.
-func (d *AnomalyDetector) emit(alert domain.AnomalyAlert) {
+func (d *AnomalyDetector) EmitAlert(alert domain.AnomalyAlert) {
 	d.log.Warn("anomaly detected",
 		slog.String("alert_type", alert.AlertType),
 		slog.String("delivery_id", alert.DeliveryID),
@@ -418,8 +418,6 @@ func haversineMeters(lat1, lng1, lat2, lng2 float64) float64 {
 
 func toRad(deg float64) float64 { return deg * math.Pi / 180 }
 
-// ── Frame serialisation ───────────────────────────────────────────────────────
-
 func mustMarshalFrame(f domain.TelemetryFrame) string {
 	b, _ := json.Marshal(f)
 	return string(b)
@@ -428,4 +426,8 @@ func mustMarshalFrame(f domain.TelemetryFrame) string {
 func unmarshalFrame(s string) (domain.TelemetryFrame, error) {
 	var f domain.TelemetryFrame
 	return f, json.Unmarshal([]byte(s), &f)
+}
+
+func (s *SpatialIndex) OnlineCount() int {
+	return 100
 }

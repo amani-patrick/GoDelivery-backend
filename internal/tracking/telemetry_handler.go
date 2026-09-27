@@ -39,24 +39,27 @@ var wsUpgrader = websocket.Upgrader{
 
 // Every field has an explicit type — no interface{} / any.
 type inboundMsg struct {
-	Type       string  `json:"type"`       
-	DeliveryID string  `json:"delivery_id"`
-	Lat        float64 `json:"lat"`
-	Lng        float64 `json:"lng"`
-	SpeedKmh   float64 `json:"speed_kmh"`
-	Bearing    float64 `json:"bearing"`  
-	AccuracyM  float32 `json:"accuracy_m"`
-	Battery    float32 `json:"battery_pct"`
-	TimestampMs int64  `json:"ts_ms"` 
+	Type        string  `json:"type"`
+	DeliveryID  string  `json:"delivery_id"`
+	Lat         float64 `json:"lat"`
+	Lng         float64 `json:"lng"`
+	SpeedKmh    float64 `json:"speed_kmh"`
+	Bearing     float64 `json:"bearing"`
+	AccuracyM   float32 `json:"accuracy_m"`
+	Battery     float32 `json:"battery_pct"`
+	TimestampMs int64   `json:"ts_ms"`
+	SequenceNum int64 `json:"seq"`
+	CellTowerIDs string `json:"cell_tower_ids"`
+	WifiSSIDs    string `json:"wifi_ssids"`
+	WifiCount    int    `json:"wifi_count"`
 }
 
 // outboundMsg is sent back to the driver device.
 type outboundMsg struct {
-	Type    string `json:"type"`    // "ACK" | "ALERT" | "PONG"
+	Type    string `json:"type"`    
 	Payload string `json:"payload"`
 }
 
-// ── TelemetryHandler ─────────────────────────────────────────────────────────
 
 // DriverPresenceNotifier allows the telemetry handler to update driver
 // online status in persistent storage without importing usecase or repository
@@ -78,15 +81,16 @@ const (
 // high-frequency GPS telemetry stream. One goroutine pair (read pump + write pump)
 // is created per active driver connection.
 type TelemetryHandler struct {
-	spatial   *SpatialIndex
-	detector  *AnomalyDetector
-	ledger    domain.LedgerRepository
-	presence  DriverPresenceNotifier // nil when not wired (dev mode)
-	log       *slog.Logger
+	spatial      *SpatialIndex
+	detector     *AnomalyDetector
+	ledger       domain.LedgerRepository
+	presence     DriverPresenceNotifier // nil when not wired 
+	log          *slog.Logger
+	seqGuard     *SequenceGuard
+	spoofDetect  *SpoofDetector
 
-	// connMu guards activeConns for concurrent read/write.
 	connMu      sync.RWMutex
-	activeConns map[string]*websocket.Conn // driverID → connection
+	activeConns map[string]*websocket.Conn 
 }
 
 // NewTelemetryHandler constructs the handler with all dependencies injected.
@@ -104,6 +108,8 @@ func NewTelemetryHandler(
 		ledger:      ledger,
 		presence:    presence,
 		log:         log,
+		seqGuard:    NewSequenceGuard(log),
+		spoofDetect: NewSpoofDetector(log),
 		activeConns: make(map[string]*websocket.Conn),
 	}
 }
@@ -212,6 +218,37 @@ func (h *TelemetryHandler) handleFrame(
 		return
 	}
 
+	// ── Gate 2: sequence number guard  ────────────────────────────
+	// Monotonically-increasing seq prevents TCP-handover duplicates and replay
+	// attacks from corrupting the spatial index or triggering false anomalies.
+	if msg.SequenceNum > 0 && !h.seqGuard.Accept(driverID, msg.SequenceNum) {
+		// Out-of-order or duplicate — silently drop. No error to client.
+		return
+	}
+
+	// ── Gate 3: GPS spoof heuristic  ──────────────────────────────
+	// If the device's network fingerprint is implausible for the claimed
+	// coordinate, emit a TELEMETRY_SPOOF_WARN alert and deprioritize the driver
+	// (they are NOT dropped entirely — false positives must not harm real drivers).
+	fp := NetworkFingerprint{
+		CellTowerIDs: msg.CellTowerIDs,
+		WifiSSIDs:    msg.WifiSSIDs,
+		WifiCount:    msg.WifiCount,
+	}
+	if suspicious, reason := h.spoofDetect.IsSuspicious(fp, msg.Lat, msg.Lng); suspicious {
+		h.detector.EmitAlert(domain.AnomalyAlert{
+			DeliveryID:   msg.DeliveryID,
+			DriverID:     driverID,
+			AlertType:    "TELEMETRY_SPOOF_WARN",
+			LastKnownLat: msg.Lat,
+			LastKnownLng: msg.Lng,
+			DetectedAt:   time.Now().UTC(),
+			Details:      reason,
+		})
+		// Continue processing — deprioritization is handled by the matching engine
+		// reading trust signals, not by dropping the frame entirely.
+	}
+
 	frame := domain.TelemetryFrame{
 		DeliveryID: msg.DeliveryID,
 		DriverID:   driverID,
@@ -241,7 +278,7 @@ func (h *TelemetryHandler) handleFrame(
 			slog.Float64("implied_kmh", velocity.ImpliedKmh),
 		)
 		// Emit an alert so dispatchers are notified even though the frame is dropped.
-		h.detector.emit(domain.AnomalyAlert{
+		h.detector.EmitAlert(domain.AnomalyAlert{
 			DeliveryID:   msg.DeliveryID,
 			DriverID:     driverID,
 			AlertType:    "ROUTE_DEVIATION",
@@ -266,7 +303,7 @@ func (h *TelemetryHandler) handleFrame(
 		return
 	}
 
-	// Task 3: Refresh heartbeat TTL — proves driver is still alive and connected.
+	// : Refresh heartbeat TTL — proves driver is still alive and connected.
 	// The heartbeat scanner in SpatialIndex.RunHeartbeatScanner forces drivers
 	// offline in Postgres when this key expires after 90 seconds of silence.
 	h.spatial.RefreshHeartbeat(ctx, driverID)
@@ -299,7 +336,7 @@ func (h *TelemetryHandler) handlePanic(
 		)
 	}
 
-	h.detector.emit(domain.AnomalyAlert{
+	h.detector.EmitAlert(domain.AnomalyAlert{
 		DeliveryID:   msg.DeliveryID,
 		DriverID:     driverID,
 		AlertType:    "PANIC",
@@ -372,7 +409,7 @@ func (h *TelemetryHandler) deregisterConn(driverID string, conn *websocket.Conn)
 	}
 	_ = conn.Close()
 
-	// Task 3: Phantom online fix — force driver offline in Postgres and remove
+	// : Phantom online fix — force driver offline in Postgres and remove
 	// from Redis geo index the moment their WebSocket connection closes.
 	// We use a background context because the request context is already cancelled.
 	bgCtx := context.Background()
