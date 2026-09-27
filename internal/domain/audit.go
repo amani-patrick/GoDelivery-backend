@@ -5,8 +5,6 @@ import (
 	"time"
 )
 
-// ── AuditEvent ────────────────────────────────────────────────────────────────
-
 // AuditEvent is an immutable domain event appended to the ledger on every
 // significant system action. Records are never updated or deleted.
 //
@@ -15,17 +13,16 @@ import (
 // PostgreSQL must have INSERT-only grants at the database-role level.
 type AuditEvent struct {
 	ID         string    `json:"id"`
-	EntityID   string    `json:"entity_id"`   // e.g. delivery_id, user_id
-	EntityType string    `json:"entity_type"` // "DELIVERY" | "USER" | "DRIVER"
-	ActorID    string    `json:"actor_id"`    // user_id of the actor, or "SYSTEM"
-	Action     string    `json:"action"`      // e.g. "DELIVERY_CREATED", "HANDSHAKE_FAILED_PICKUP"
+	EntityID   string    `json:"entity_id"`   
+	EntityType string    `json:"entity_type"` 
+	ActorID    string    `json:"actor_id"`    
+	Action     string    `json:"action"`      
 	OldState   string    `json:"old_state,omitempty"`
 	NewState   string    `json:"new_state,omitempty"`
-	Metadata   string    `json:"metadata,omitempty"` // free-form JSON blob for extra context
+	Metadata   string    `json:"metadata,omitempty"` 
 	CreatedAt  time.Time `json:"created_at"`
 }
 
-// ── LedgerRepository ─────────────────────────────────────────────────────────
 
 // LedgerRepository is the persistence contract for the append-only audit ledger.
 // Implementations must guarantee that Append never updates or deletes records.

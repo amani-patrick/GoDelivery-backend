@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// ── Additional sentinel errors ────────────────────────────────────────────────
 
 var (
 	ErrDriverNotEligible    = errors.New("driver not eligible for this delivery")
@@ -15,9 +14,7 @@ var (
 	ErrVehicleTypeMismatch  = errors.New("driver vehicle type does not match delivery requirement")
 )
 
-// ── Role ──────────────────────────────────────────────────────────────────────
 
-// Role enumerates every actor type in the system.
 type Role string
 
 const (
@@ -36,8 +33,6 @@ func (r Role) IsValid() bool {
 	return false
 }
 
-// ── VehicleType ───────────────────────────────────────────────────────────────
-
 // VehicleType classifies a driver's vehicle for capacity-filtered dispatch.
 // The matching engine uses this to ensure a single-iPhone shipment never gets
 // routed to a Fuso truck, and 50 bags of cement never go to a motorcycle.
@@ -50,7 +45,6 @@ const (
 	VehicleTruck      VehicleType = "TRUCK"
 )
 
-// IsValid reports whether v is one of the defined constants.
 func (v VehicleType) IsValid() bool {
 	switch v {
 	case VehicleMotorcycle, VehicleCar, VehicleVan, VehicleTruck:
@@ -75,8 +69,6 @@ func (v VehicleType) DefaultMaxWeightKg() float64 {
 	}
 	return 0
 }
-
-// ── DriverStatus ──────────────────────────────────────────────────────────────
 
 // DriverStatus is the operational lifecycle state of a driver account.
 // Drivers cannot start accepting orders until a human administrator transitions
@@ -105,9 +97,6 @@ const (
 func (s DriverStatus) CanAcceptOrders() bool {
 	return s == DriverActive
 }
-
-// ── User aggregate root ───────────────────────────────────────────────────────
-
 // User is the shared identity aggregate for all actor types.
 // PasswordHash carries json:"-" to prevent accidental serialisation.
 type User struct {
@@ -116,9 +105,9 @@ type User struct {
 	Phone        string    `json:"phone"`          // Rwanda format: +2507XXXXXXXX
 	Email        string    `json:"email,omitempty"`
 	Role         Role      `json:"role"`
-	PasswordHash string    `json:"-"`              // bcrypt hash — NEVER expose
+	PasswordHash string    `json:"-"`              
 	IsActive     bool      `json:"is_active"`
-	IsVerified   bool      `json:"is_verified"`    // true after phone OTP confirmation
+	IsVerified   bool      `json:"is_verified"`   
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -149,8 +138,8 @@ type DriverProfile struct {
 
 	Rating          float64    `json:"rating"`
 	TotalDeliveries int        `json:"total_deliveries"`
-	TrustScore      float64    `json:"trust_score"`  // 0.0–1.0; 1.0 = fully trusted (task 9)
-	TrustLevel      TrustLevel `json:"trust_level"`  // derived from TrustScore
+	TrustScore      float64    `json:"trust_score"`  
+	TrustLevel      TrustLevel `json:"trust_level"` 
 }
 
 // IsEligibleFor returns nil when the driver can be dispatched for a delivery
@@ -181,7 +170,7 @@ type BusinessProfile struct {
 	Location      Location `json:"location"`
 	District      string   `json:"district"`
 	IsVerified    bool     `json:"is_verified"`
-	TrustScore    float64  `json:"trust_score"` // task 9
+	TrustScore    float64  `json:"trust_score"`
 	TrustLevel    TrustLevel `json:"trust_level"`
 }
 

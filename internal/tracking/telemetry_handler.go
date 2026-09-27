@@ -15,8 +15,6 @@ import (
 	"github.com/umurinzi/backend/internal/middleware"
 )
 
-// ── WebSocket constants ───────────────────────────────────────────────────────
-
 const (
 	// wsReadLimit caps inbound message size to protect against memory exhaustion.
 	wsReadLimit = 4 * 1024 // 4 KB is generous for a GPS frame
@@ -39,20 +37,17 @@ var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// ── Wire types ────────────────────────────────────────────────────────────────
-
-// inboundMsg is the strictly-typed structure expected from driver devices.
 // Every field has an explicit type — no interface{} / any.
 type inboundMsg struct {
-	Type       string  `json:"type"`        // "FRAME" | "PANIC" | "PING"
+	Type       string  `json:"type"`       
 	DeliveryID string  `json:"delivery_id"`
 	Lat        float64 `json:"lat"`
 	Lng        float64 `json:"lng"`
 	SpeedKmh   float64 `json:"speed_kmh"`
-	Bearing    float64 `json:"bearing"`   // compass degrees 0–360
+	Bearing    float64 `json:"bearing"`  
 	AccuracyM  float32 `json:"accuracy_m"`
 	Battery    float32 `json:"battery_pct"`
-	TimestampMs int64  `json:"ts_ms"` // Unix milliseconds, device clock
+	TimestampMs int64  `json:"ts_ms"` 
 }
 
 // outboundMsg is sent back to the driver device.

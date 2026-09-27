@@ -11,15 +11,11 @@ import (
 	"github.com/umurinzi/backend/internal/matching"
 )
 
-// ── DriverUsecase ─────────────────────────────────────────────────────────────
 
 // DriverUsecase orchestrates all driver-lifecycle operations: registration,
 // administrator approval/suspension, online/offline toggling, and the
 // capacity-filtered matching engine query used by dispatch.
-//
-// Module boundary: this usecase coordinates through the domain repository
-// interfaces only. The matching.Engine is injected so dispatch decisions
-// remain testable without a real OSRM instance.
+
 type DriverUsecase struct {
 	driverRepo   domain.DriverProfileRepository
 	businessRepo domain.BusinessProfileRepository
@@ -30,9 +26,6 @@ type DriverUsecase struct {
 	log          *slog.Logger
 }
 
-// NewDriverUsecase constructs the usecase with all required repositories.
-// engine may be nil — in that case DispatchForDelivery falls back to the
-// simple Postgres-only FindEligibleDrivers path (no OSRM, no scoring).
 func NewDriverUsecase(
 	driverRepo domain.DriverProfileRepository,
 	businessRepo domain.BusinessProfileRepository,
@@ -53,21 +46,18 @@ func NewDriverUsecase(
 	}
 }
 
-// ── RegisterDriver ────────────────────────────────────────────────────────────
-
-// RegisterDriverInput carries the self-submitted registration data from a
-// driver who has already created a User account.
+//RegisterDriverInput carries the self-submitted registration data from a
+//driver who has already created a User account.
 type RegisterDriverInput struct {
 	UserID        string
-	NationalID    string           // 16-digit Rwanda NID
+	NationalID    string          
 	LicenseNumber string
 	VehicleType   domain.VehicleType
 	PlateNumber   string
-	MaxWeightKg   float64          // optional: defaults to VehicleType.DefaultMaxWeightKg()
+	MaxWeightKg   float64          //optional: defaults to VehicleType.DefaultMaxWeightKg()
 }
 
-// RegisterDriver creates a DriverProfile in PENDING_VERIFICATION state.
-// The driver cannot accept any orders until an administrator calls ApproveDriver.
+//RegisterDriver creates a DriverProfile in PENDING_VERIFICATION state.
 func (uc *DriverUsecase) RegisterDriver(ctx context.Context, in RegisterDriverInput) (*domain.DriverProfile, error) {
 	if !in.VehicleType.IsValid() {
 		return nil, fmt.Errorf("%w: unknown vehicle type %q", domain.ErrInvalidInput, in.VehicleType)
@@ -119,10 +109,6 @@ func (uc *DriverUsecase) RegisterDriver(ctx context.Context, in RegisterDriverIn
 	return p, nil
 }
 
-// ── ApproveDriver ─────────────────────────────────────────────────────────────
-
-// ApproveDriver transitions a driver from PENDING_VERIFICATION to ACTIVE.
-// Must only be called by a user with the DISPATCHER role.
 func (uc *DriverUsecase) ApproveDriver(ctx context.Context, driverUserID, approvedByUserID string) error {
 	profile, err := uc.driverRepo.GetByUserID(ctx, driverUserID)
 	if err != nil {
@@ -152,10 +138,6 @@ func (uc *DriverUsecase) ApproveDriver(ctx context.Context, driverUserID, approv
 	return nil
 }
 
-// ── SuspendDriver ─────────────────────────────────────────────────────────────
-
-// SuspendDriver transitions a driver to SUSPENDED status with a mandatory reason.
-// Must only be called by a user with the DISPATCHER role.
 func (uc *DriverUsecase) SuspendDriver(ctx context.Context, driverUserID, suspendedByUserID, reason string) error {
 	if reason == "" {
 		return fmt.Errorf("%w: suspension reason is required", domain.ErrInvalidInput)
@@ -175,7 +157,7 @@ func (uc *DriverUsecase) SuspendDriver(ctx context.Context, driverUserID, suspen
 		return err
 	}
 
-	// Also force the driver offline immediately
+	// Force the driver offline immediately
 	_ = uc.driverRepo.SetOnlineStatus(ctx, driverUserID, false)
 
 	uc.appendAudit(ctx, driverUserID, suspendedByUserID, "DRIVER_SUSPENDED",
@@ -189,11 +171,6 @@ func (uc *DriverUsecase) SuspendDriver(ctx context.Context, driverUserID, suspen
 	return nil
 }
 
-// ── SetOnline / SetOffline ────────────────────────────────────────────────────
-
-// SetOnline marks a driver as available for dispatch.
-// Only ACTIVE drivers may go online — PENDING_VERIFICATION and SUSPENDED
-// drivers are blocked here before any Redis geo update is attempted.
 func (uc *DriverUsecase) SetOnline(ctx context.Context, driverUserID string) error {
 	profile, err := uc.driverRepo.GetByUserID(ctx, driverUserID)
 	if err != nil {
@@ -210,7 +187,6 @@ func (uc *DriverUsecase) SetOnline(ctx context.Context, driverUserID string) err
 	return nil
 }
 
-// SetOffline marks a driver as unavailable. Safe to call regardless of status.
 func (uc *DriverUsecase) SetOffline(ctx context.Context, driverUserID string) error {
 	if err := uc.driverRepo.SetOnlineStatus(ctx, driverUserID, false); err != nil {
 		return err
@@ -219,36 +195,17 @@ func (uc *DriverUsecase) SetOffline(ctx context.Context, driverUserID string) er
 	return nil
 }
 
-// ── GetDriverProfile ──────────────────────────────────────────────────────────
-
-// GetDriverProfile returns the profile for a given driver user ID.
-// NationalID and LicenseNumber are stripped before the result is used in
-// API responses — callers in the handler layer must use marshalDriverProfile.
 func (uc *DriverUsecase) GetDriverProfile(ctx context.Context, userID string) (*domain.DriverProfile, error) {
 	return uc.driverRepo.GetByUserID(ctx, userID)
 }
 
-// ── FindEligibleDrivers (matching engine) ────────────────────────────────────
-
-// FindEligibleDriversInput carries the filters for the matching engine.
 type FindEligibleDriversInput struct {
-	// NearbyDriverIDs are candidate driver IDs from the Redis geo-search.
-	// The caller (dispatch handler or CreateDelivery usecase) fetches these
-	// from SpatialIndex.FindNearbyDrivers before calling this method.
 	NearbyDriverIDs []string
-
-	// MinWeightKg filters out drivers whose vehicle cannot carry the package.
 	MinWeightKg float64
-
-	// RequiredVehicleType filters by vehicle class. Empty = any type.
-	RequiredVehicleType domain.VehicleType
+	RequiredVehicleType domain.VehicleType // optional = any type
 }
 
-// FindEligibleDrivers is the matching engine. It takes geo-candidates from Redis
-// and applies Postgres-side capacity and status filters to return an ordered
-// list of DispatchCandidates suitable for job notification.
-//
-// Architecture note: this usecase deliberately does NOT call Redis or the
+// This usecase deliberately does NOT call Redis or the
 // SpatialIndex directly. The caller is responsible for supplying NearbyDriverIDs
 // from a prior geo-search. This keeps the usecase layer infrastructure-agnostic
 // and makes the matching logic independently testable.
@@ -271,7 +228,6 @@ func (uc *DriverUsecase) FindEligibleDrivers(
 	for _, p := range profiles {
 		u, err := uc.userRepo.GetByID(ctx, p.UserID)
 		if err != nil {
-			// A missing user is a data integrity anomaly — log and skip.
 			uc.log.Error("FindEligibleDrivers: user not found for driver profile",
 				slog.String("user_id", p.UserID),
 				slog.String("reason", err.Error()),
@@ -285,13 +241,10 @@ func (uc *DriverUsecase) FindEligibleDrivers(
 			VehicleType: p.VehicleType,
 			PlateNumber: p.PlateNumber,
 			MaxWeightKg: p.MaxWeightKg,
-			// DistanceKm will be populated by the caller from the Redis geo result
 		})
 	}
 	return candidates, nil
 }
-
-// ── DispatchForDelivery (two-tier matching engine) ────────────────────────────
 
 // DispatchForDelivery runs the full two-tier matching pipeline for a delivery
 // and returns a ranked list of scored candidates.
@@ -301,11 +254,7 @@ func (uc *DriverUsecase) FindEligibleDrivers(
 //
 // When the engine is nil (e.g. local dev without OSRM) it falls back to the
 // simple Postgres FindEligibleDrivers path and returns unsorted candidates.
-//
-// The caller (CreateDelivery usecase or handler) should:
-//  1. Call DispatchForDelivery to get the ranked list.
-//  2. Notify the Winner first via WebSocket push or push notification.
-//  3. If Winner declines within a timeout, notify the second-ranked candidate.
+
 func (uc *DriverUsecase) DispatchForDelivery(
 	ctx context.Context,
 	deliveryID string,
@@ -358,9 +307,6 @@ func (uc *DriverUsecase) DispatchForDelivery(
 	return result, nil
 }
 
-// EnqueueForDispatch adds a delivery to the batch matching queue.
-// Call this immediately after CreateDelivery persists the aggregate.
-// The matching engine drains the queue every BatchWindowMs milliseconds.
 func (uc *DriverUsecase) EnqueueForDispatch(
 	ctx context.Context,
 	deliveryID string,
@@ -369,7 +315,7 @@ func (uc *DriverUsecase) EnqueueForDispatch(
 	vehicleTypeRequired domain.VehicleType,
 ) error {
 	if uc.engine == nil {
-		return nil // no-op when engine is not wired
+		return nil 
 	}
 	return uc.engine.Enqueue(ctx, domain.BatchOrder{
 		DeliveryID:          deliveryID,
@@ -380,9 +326,6 @@ func (uc *DriverUsecase) EnqueueForDispatch(
 	})
 }
 
-// ── Business profile ──────────────────────────────────────────────────────────
-
-// UpsertBusinessProfileInput carries merchant hub data submitted at onboarding.
 type UpsertBusinessProfileInput struct {
 	UserID        string
 	CompanyName   string
@@ -394,7 +337,6 @@ type UpsertBusinessProfileInput struct {
 	District      string
 }
 
-// UpsertBusinessProfile creates or updates the merchant's operating hub data.
 func (uc *DriverUsecase) UpsertBusinessProfile(ctx context.Context, in UpsertBusinessProfileInput) (*domain.BusinessProfile, error) {
 	if in.CompanyName == "" {
 		return nil, fmt.Errorf("%w: company_name is required", domain.ErrInvalidInput)
@@ -408,7 +350,7 @@ func (uc *DriverUsecase) UpsertBusinessProfile(ctx context.Context, in UpsertBus
 		PickupAddress: in.PickupAddress,
 		Location:      domain.Location{Lat: in.Lat, Lng: in.Lng},
 		District:      in.District,
-		IsVerified:    false, // remains false until administrator verifies
+		IsVerified:    false, 
 	}
 
 	if err := uc.businessRepo.Upsert(ctx, p); err != nil {
@@ -421,14 +363,10 @@ func (uc *DriverUsecase) UpsertBusinessProfile(ctx context.Context, in UpsertBus
 	return p, nil
 }
 
-// GetBusinessProfile returns the merchant's hub profile.
 func (uc *DriverUsecase) GetBusinessProfile(ctx context.Context, userID string) (*domain.BusinessProfile, error) {
 	return uc.businessRepo.GetByUserID(ctx, userID)
 }
 
-// ── Customer profile ──────────────────────────────────────────────────────────
-
-// UpsertCustomerSavedLocation stores or updates the customer's last drop-off point.
 func (uc *DriverUsecase) UpsertCustomerSavedLocation(ctx context.Context, userID string, lat, lng float64) error {
 	p := &domain.CustomerProfile{
 		UserID:        userID,
@@ -437,12 +375,9 @@ func (uc *DriverUsecase) UpsertCustomerSavedLocation(ctx context.Context, userID
 	return uc.customerRepo.Upsert(ctx, p)
 }
 
-// GetCustomerProfile returns the customer profile with their saved location.
 func (uc *DriverUsecase) GetCustomerProfile(ctx context.Context, userID string) (*domain.CustomerProfile, error) {
 	return uc.customerRepo.GetByUserID(ctx, userID)
 }
-
-// ── Audit helper ──────────────────────────────────────────────────────────────
 
 func (uc *DriverUsecase) appendAudit(
 	ctx context.Context,

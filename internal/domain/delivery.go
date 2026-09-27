@@ -1,6 +1,4 @@
-// Package domain contains the enterprise core: aggregate roots, value objects,
-// domain events, sentinel errors, and repository interfaces.
-// Nothing in this package imports from any other internal package.
+
 package domain
 
 import (
@@ -9,7 +7,11 @@ import (
 	"time"
 )
 
-// ── Sentinel errors ───────────────────────────────────────────────────────────
+
+// Package domain contains the enterprise core: aggregate roots, value objects,
+// domain events, sentinel errors, and repository interfaces.
+// Nothing in this package imports from any other internal package.
+
 // All errors are defined here so any layer can do errors.Is() comparisons
 // without importing concrete infrastructure packages.
 
@@ -27,9 +29,8 @@ var (
 	ErrActorBanned            = errors.New("actor is banned from the platform")
 )
 
-// ── Value Objects ─────────────────────────────────────────────────────────────
 
-// Location is an immutable geographic coordinate pair (WGS-84).
+// Location is an immutable geographic coordinate pair.
 // It is a value object: equality is structural, it has no identity.
 type Location struct {
 	Lat float64 `json:"lat"`
@@ -40,8 +41,6 @@ type Location struct {
 func (l Location) IsZero() bool {
 	return l.Lat == 0 && l.Lng == 0
 }
-
-// ── DeliveryState — finite-state-machine type ─────────────────────────────────
 
 // DeliveryState represents a single node in the delivery lifecycle graph.
 type DeliveryState string
@@ -66,8 +65,6 @@ var validTransitions = map[DeliveryState]map[DeliveryState]bool{
 	StateDisputed:  {StateCancelled: true},
 }
 
-// ── Delivery aggregate root ───────────────────────────────────────────────────
-
 // PackageCategory classifies the type of goods being shipped.
 // Used by the matching engine to select appropriate vehicle types and
 // as metadata for insurance and customs compliance.
@@ -79,7 +76,7 @@ const (
 	PackageCategoryFragile     PackageCategory = "FRAGILE"
 	PackageCategoryPerishable  PackageCategory = "PERISHABLE"
 	PackageCategoryDocuments   PackageCategory = "DOCUMENTS"
-	PackageCategoryBulk        PackageCategory = "BULK"        // e.g. cement bags, construction
+	PackageCategoryBulk        PackageCategory = "BULK"       
 )
 
 // Delivery is the central aggregate root of the system.
@@ -103,7 +100,6 @@ type Delivery struct {
 	Description  string          `json:"description"`
 	WeightKg     float64         `json:"weight_kg"`
 
-	// Confirmed at pickup by driver (task 5 — weight fraud guard).
 	// Zero means not yet confirmed. Set during ConfirmPickup.
 	ConfirmedWeightKg float64 `json:"confirmed_weight_kg,omitempty"`
 
@@ -111,12 +107,10 @@ type Delivery struct {
 	VehicleTypeRequired VehicleType     `json:"vehicle_type_required,omitempty"`
 	PackageCategory     PackageCategory `json:"package_category"`
 
-	// Priority level for premium delivery (task 7).
 	// 0 = standard, 1 = priority, 2 = premium.
 	PriorityLevel int `json:"priority_level"`
 
 	// Stacking sequence: 0 = solo delivery, ≥1 = position in a stacked route.
-	// Set by the matching engine when a stack is approved (task 4).
 	StackSequence int    `json:"stack_sequence,omitempty"`
 	StackGroupID  string `json:"stack_group_id,omitempty"` // shared across stacked deliveries
 
@@ -133,9 +127,7 @@ type Delivery struct {
 //     (hash == hash) passes. An empty or mismatched token fails immediately.
 //   - IN_TRANSIT → DELIVERED: same protocol using DeliveryPIN.
 //   - All other transitions: inputToken is ignored; pass "".
-//
-// On success, CurrentState and UpdatedAt are mutated in-place.
-// Callers are responsible for persisting the updated aggregate.
+
 func (d *Delivery) Transition(next DeliveryState, inputToken string) error {
 	allowed, stateKnown := validTransitions[d.CurrentState]
 	if !stateKnown || !allowed[next] {
@@ -165,10 +157,8 @@ func (d *Delivery) IsTerminal() bool {
 	return len(allowed) == 0
 }
 
-// ── Repository interfaces ─────────────────────────────────────────────────────
 // Interfaces are owned by the domain layer.
 // Concrete implementations live in internal/delivery/repository.
-// The domain layer never imports infrastructure packages.
 
 // DeliveryRepository is the persistence contract for the Delivery aggregate.
 type DeliveryRepository interface {
@@ -180,11 +170,11 @@ type DeliveryRepository interface {
 	ListByMerchant(ctx context.Context, merchantID string, states []DeliveryState) ([]*Delivery, error)
 
 	// UpdateConfirmedWeight sets the confirmed_weight_kg field after physical
-	// weighing at pickup. Distinct from Update to minimise write surface (task 5).
+	// weighing at pickup. Distinct from Update to minimise write surface 
 	UpdateConfirmedWeight(ctx context.Context, deliveryID string, confirmedKg float64) error
 
 	// UpdateStackInfo writes the stack_group_id and stack_sequence for a stacked
-	// delivery after the matching engine approves a multi-drop route (task 4).
+	// delivery after the matching engine approves a multi-drop route 
 	UpdateStackInfo(ctx context.Context, deliveryID, stackGroupID string, sequence int) error
 
 	// ListActiveByDriver returns all non-terminal deliveries for a driver.

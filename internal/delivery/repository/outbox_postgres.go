@@ -179,8 +179,7 @@ func (r *OutboxPostgresRepo) MarkFailed(ctx context.Context, id, reason string) 
 
 // ScheduleRetry sets the next retry time using exponential back-off.
 // The OutboxWorker computes nextRetryAt:
-//
-//	nextRetryAt = now + (2^attempt * baseIntervalSeconds)
+
 func (r *OutboxPostgresRepo) ScheduleRetry(ctx context.Context, id string, nextRetryAt time.Time) error {
 	const q = `
 		UPDATE payment_events

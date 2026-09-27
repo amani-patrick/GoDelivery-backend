@@ -11,19 +11,8 @@ import (
 )
 
 // AlertChannelSize is the buffer depth of the alert channel.
-// At 256 slots it absorbs burst periods without dropping alerts
-// while keeping backpressure visible in logs when it fills up.
 const AlertChannelSize = 256
 
-// Dispatcher is the single consumer of the AnomalyAlert channel.
-// It fans out each alert to three destinations:
-//  1. Structured log (visible to real-time security operations)
-//  2. Immutable audit ledger (compliance + forensics)
-//  3. Driver WebSocket connection (safety check-in prompt on device)
-//
-// The Dispatcher communicates with other modules only through the
-// domain.LedgerRepository interface and TelemetryHandler.BroadcastAlert —
-// never through direct cross-module database writes.
 type Dispatcher struct {
 	alertCh <-chan domain.AnomalyAlert
 	ledger  domain.LedgerRepository
@@ -46,10 +35,6 @@ func NewDispatcher(
 	}
 }
 
-// Run starts the event loop. It blocks until ctx is cancelled or the alert
-// channel is closed. Call it in a dedicated goroutine:
-//
-//	go dispatcher.Run(ctx)
 func (d *Dispatcher) Run(ctx context.Context) {
 	d.log.Info("dispatcher started")
 	for {
@@ -67,11 +52,8 @@ func (d *Dispatcher) Run(ctx context.Context) {
 	}
 }
 
-// handle processes a single alert. All three fan-out steps are attempted
-// regardless of individual failures — a ledger write failure does not
-// prevent the driver from receiving their push notification.
 func (d *Dispatcher) handle(ctx context.Context, alert domain.AnomalyAlert) {
-	// 1. Structured log — immediately visible to on-call dispatchers
+	// Structured log — immediately visible to on-call dispatchers
 	d.log.Error("DISPATCH ALERT",
 		slog.String("alert_type", alert.AlertType),
 		slog.String("delivery_id", alert.DeliveryID),
@@ -82,7 +64,7 @@ func (d *Dispatcher) handle(ctx context.Context, alert domain.AnomalyAlert) {
 		slog.Time("detected_at", alert.DetectedAt),
 	)
 
-	// 2. Append to immutable ledger
+	//Append to immutable ledger
 	event := &domain.AuditEvent{
 		ID:         uuid.NewString(),
 		EntityID:   alert.DeliveryID,
@@ -102,7 +84,7 @@ func (d *Dispatcher) handle(ctx context.Context, alert domain.AnomalyAlert) {
 		)
 	}
 
-	// 3. Push alert to the driver's active WebSocket connection
+	// Push alert to the driver's active WebSocket connection
 	if d.handler != nil {
 		d.handler.BroadcastAlert(alert.DriverID, alert)
 	}

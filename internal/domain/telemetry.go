@@ -2,8 +2,6 @@ package domain
 
 import "time"
 
-// ── Telemetry value objects ───────────────────────────────────────────────────
-
 // TelemetryFrame is a single GPS observation emitted by a driver's device.
 // It is the raw ingest unit processed by the tracking module.
 type TelemetryFrame struct {
@@ -33,24 +31,16 @@ type PanicPayload struct {
 type AnomalyAlert struct {
 	DeliveryID   string    `json:"delivery_id"`
 	DriverID     string    `json:"driver_id"`
-	AlertType    string    `json:"alert_type"` // "STATIONARY" | "ROUTE_DEVIATION" | "PANIC"
+	AlertType    string    `json:"alert_type"`
 	LastKnownLat float64   `json:"last_known_lat"`
 	LastKnownLng float64   `json:"last_known_lng"`
 	DetectedAt   time.Time `json:"detected_at"`
 	Details      string    `json:"details"`
 }
 
-// AnomalyThresholds are the runtime-configurable detection parameters.
-// They are loaded from environment variables and injected at startup.
 type AnomalyThresholds struct {
-	// StationaryMinutes: alert if a driver on an active trip is stationary
-	// for longer than this duration at a non-designated location.
 	StationaryMinutes int `json:"stationary_minutes"`
-	// RouteDeviationMeters: alert if the driver's position deviates more than
-	// this distance from the planned OSRM route polyline.
 	RouteDeviationMeters float64 `json:"route_deviation_meters"`
-	// PanicBufferSize: number of recent frames to include in a panic payload.
-	// At 1 frame per 10 seconds, 30 frames ≈ 5 minutes of history.
 	PanicBufferSize int `json:"panic_buffer_size"`
 }
 

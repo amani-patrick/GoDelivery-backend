@@ -1,7 +1,3 @@
-// Package tracking implements the real-time GPS telemetry ingestion pipeline,
-// Redis-backed spatial index, and the anomaly detection engine.
-// It communicates with other modules exclusively through the domain interfaces
-// and the alert channel — never through direct cross-module DB writes.
 package tracking
 
 import (

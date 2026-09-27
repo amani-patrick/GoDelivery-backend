@@ -139,11 +139,7 @@ type idempotencyRecord struct {
 	DeliveryID string `json:"delivery_id"`
 }
 
-//  CreateDelivery 
 
-// CreateDelivery generates the cryptographic custody tokens, hashes them,
-// persists the aggregate, and returns the one-time plaintext values to the caller.
-//
 // Idempotency protocol:
 //   - If in.IdempotencyKey is non-empty, we check Redis for a cached result
 //     under "idem:create:<key>" before doing any work.
@@ -173,7 +169,6 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		}
 	}
 
-	//  Validate required fields 
 	if in.MerchantID == "" || in.CustomerID == "" {
 		return nil, fmt.Errorf("%w: merchant_id and customer_id are required", domain.ErrInvalidInput)
 	}
@@ -181,14 +176,13 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		return nil, fmt.Errorf("%w: weight_kg must be positive", domain.ErrInvalidInput)
 	}
 
-	//  Generate cryptographic custody tokens ─
 	rawQR, err := generateSecureToken(qrTokenBytes)
 	if err != nil {
 		return nil, fmt.Errorf("generate qr token: %w", err)
 	}
 	rawPIN := generateNumericPIN(pinDigits)
 
-	// Hash both tokens — plaintext never touches persistent storage
+	//Hash both tokens 
 	qrHash, err := bcrypt.GenerateFromPassword([]byte(rawQR), uc.bcryptCost)
 	if err != nil {
 		return nil, fmt.Errorf("hash qr token: %w", err)
@@ -200,7 +194,6 @@ func (uc *DeliveryUsecase) CreateDelivery(
 
 	now := time.Now().UTC()
 
-	// Default PackageCategory when not supplied by the merchant.
 	category := in.PackageCategory
 	if category == "" {
 		category = domain.PackageCategoryGeneral
@@ -227,7 +220,7 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		return nil, err
 	}
 
-	//  Write idempotency record to Redis ─
+	//Write idempotency record to Redis
 	if in.IdempotencyKey != "" {
 		if err := uc.writeIdempotencyCache(ctx, in.IdempotencyKey, d.ID); err != nil {
 			uc.log.Warn("CreateDelivery: idempotency cache write failed — non-fatal",
@@ -238,9 +231,6 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		}
 	}
 
-	//  Enqueue for batch dispatch 
-	// This is non-fatal — if the queue write fails the order is still persisted
-	// and can be dispatched via the immediate DispatchForDelivery path.
 	if uc.dispatchEnqueuer != nil {
 		if err := uc.dispatchEnqueuer(ctx, d.ID, d.PickupLoc.Lat, d.PickupLoc.Lng,
 			d.WeightKg, d.VehicleTypeRequired); err != nil {
@@ -261,15 +251,14 @@ func (uc *DeliveryUsecase) CreateDelivery(
 	}, nil
 }
 
-// checkIdempotencyCache looks up the Redis key and re-fetches the delivery
-// from Postgres if a record exists. Returns (nil, false, nil) on a cache miss.
+//Returns (nil, false, nil) on a cache miss.
 func (uc *DeliveryUsecase) checkIdempotencyCache(
 	ctx context.Context, key string,
 ) (*CreateDeliveryOutput, bool, error) {
 	cacheKey := idempotencyPrefix + key
 	raw, err := uc.redisClient.Get(ctx, cacheKey).Result()
 	if err != nil {
-		// redis.Nil means key doesn't exist — that's a normal cache miss, not an error.
+		// redis.Nil means key doesn't exist = a normal cache miss.
 		if err.Error() == "redis: nil" {
 			return nil, false, nil
 		}
@@ -289,12 +278,9 @@ func (uc *DeliveryUsecase) checkIdempotencyCache(
 	return &CreateDeliveryOutput{
 		Delivery:    d,
 		IsDuplicate: true,
-		// PlaintextQRCode and PlaintextPIN are intentionally empty — tokens are
-		// one-time-use and must not be re-served on duplicate requests.
 	}, true, nil
 }
 
-// writeIdempotencyCache stores a minimal idempotency record in Redis with a TTL.
 func (uc *DeliveryUsecase) writeIdempotencyCache(
 	ctx context.Context, key, deliveryID string,
 ) error {
@@ -307,21 +293,19 @@ func (uc *DeliveryUsecase) writeIdempotencyCache(
 	return uc.redisClient.Set(ctx, cacheKey, string(b), idempotencyTTL).Err()
 }
 
-//  AcceptOrder ─
-
 // AcceptOrder assigns a driver to a delivery. It enforces three layers of
 // protection before writing anything:
 //
 //  1. Driver eligibility: the driver must be ACTIVE with a vehicle that can
 //     carry the package weight and matches the required vehicle type.
 //  2. Redis distributed lock: prevents two drivers from accepting the same
-//     order simultaneously (atomic NX with conditional Lua release).
+//     order simultaneously.
 //  3. State machine: the delivery must still be in CREATED state after the
-//     lock is acquired (guards against zombie replays).
-//
+//     lock is acquired .
+
 // On success the driver's status is moved to ON_TRIP.
 func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID string) error {
-	//  Step 1: Driver eligibility check (before acquiring the lock) 
+	//Driver eligibility check 
 	driverProfile, err := uc.driverRepo.GetByUserID(ctx, driverID)
 	if err != nil {
 		uc.log.Warn("AcceptOrder: driver profile not found",
@@ -350,8 +334,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		)
 		return eligErr
 	}
-
-	//  Task 2: Concurrent acceptance guard ─
+	
 	// If the matching engine registered an intended winner and this driver is
 	// not that winner, block them while the TTL is still active.
 	// After TTL expires (getIntended returns ""), any driver may accept.
@@ -367,7 +350,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		}
 	}
 
-	//  Step 2: Redis distributed lock 
+	//Redis distributed lock 
 	lockKey := "lock:delivery:" + deliveryID
 
 	acquired, err := uc.redisClient.SetNX(ctx, lockKey, driverID, lockTTL).Result()
@@ -386,7 +369,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		)
 		return domain.ErrLockAcquisitionFailed
 	}
-	// Conditional Lua release — only deletes if we still own the key.
+	//Conditional Lua release.
 	defer func() {
 		released, delErr := uc.redisClient.Eval(
 			ctx, luaReleaseLock, []string{lockKey}, driverID,
@@ -404,9 +387,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		}
 	}()
 
-	//  Step 3: Re-read delivery inside the lock and run state machine 
-	// Re-fetch after acquiring the lock in case the state changed between our
-	// pre-lock read and now (e.g. dispatcher cancelled the order).
+	// Re-read delivery inside the lock and run state machine 
 	delivery, err = uc.repo.GetByID(ctx, deliveryID)
 	if err != nil {
 		return err
@@ -428,7 +409,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		return err
 	}
 
-	//  Step 4: Move driver status to ON_TRIP ─
+	// Move driver status to ON_TRIP
 	if err := uc.driverRepo.SetOnTrip(ctx, driverID, true); err != nil {
 		uc.log.Error("AcceptOrder: SetOnTrip failed — delivery assigned but driver status not updated",
 			slog.String("delivery_id", deliveryID),
@@ -437,7 +418,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		)
 	}
 
-	//  Task 1: Clear re-dispatch pending key ─
+	// Clear re-dispatch pending key
 	// The driver accepted — stop the re-dispatch countdown.
 	if uc.clearPending != nil {
 		uc.clearPending(ctx, deliveryID)
@@ -450,18 +431,8 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 	return nil
 }
 
-//  ConfirmPickup ─
-
 // ConfirmPickup validates the QR token scanned by the driver, records the
 // confirmed package weight, and transitions the delivery to IN_TRANSIT.
-//
-// Weight fraud guard (task 5):
-//   The driver app submits the physical weight they weighed at pickup.
-//   If confirmedWeightKg > 0 and the driver's vehicle cannot carry it,
-//   the transition is blocked, a WEIGHT_FRAUD trust signal is emitted,
-//   and ErrWeightMismatch is returned. The merchant must correct the declared
-//   weight or send a larger vehicle before the handshake can proceed.
-//   Pass confirmedWeightKg = 0 to skip the weight check (legacy clients).
 //
 // Token protocol:
 //  1. Driver scans the physical QR code; the app submits the raw token string.
@@ -482,7 +453,7 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 		return domain.ErrUnauthorized
 	}
 
-	// Constant-time hash comparison — prevents timing oracle attacks.
+	// Constant-time hash comparison 
 	if err := bcrypt.CompareHashAndPassword([]byte(delivery.PickupQRCode), []byte(scannedToken)); err != nil {
 		uc.log.Warn("ConfirmPickup: QR code mismatch",
 			slog.String("delivery_id", deliveryID),
@@ -490,13 +461,13 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 		)
 		uc.appendAudit(ctx, deliveryID, driverID, "HANDSHAKE_FAILED_PICKUP",
 			string(delivery.CurrentState), "", "qr_token_mismatch")
-		// Emit trust signal for repeated handshake failures (task 9)
+		//Emit trust signal for repeated handshake failures
 		uc.emitTrustSignal(ctx, driverID, "DRIVER", domain.SignalHandshakeFail, 2,
 			fmt.Sprintf("QR mismatch on delivery %s", deliveryID))
 		return domain.ErrHandshakeFailed
 	}
 
-	//  Weight fraud guard (task 5) ─
+	//  Weight fraud guard
 	if confirmedWeightKg > 0 && confirmedWeightKg != delivery.WeightKg {
 		// Fetch driver profile to check vehicle capacity against actual weight.
 		driverProfile, err := uc.driverRepo.GetByUserID(ctx, driverID)
@@ -512,7 +483,7 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 				string(delivery.CurrentState), "",
 				fmt.Sprintf("declared=%.1fkg confirmed=%.1fkg vehicle_max=%.1fkg",
 					delivery.WeightKg, confirmedWeightKg, driverProfile.MaxWeightKg))
-			// Emit weight fraud trust signal against the merchant (they declared wrong)
+			// Emit weight fraud trust signal against the merchant
 			uc.emitTrustSignal(ctx, delivery.MerchantID, "MERCHANT", domain.SignalWeightFraud, 3,
 				fmt.Sprintf("delivery %s: declared %.1f kg but confirmed %.1f kg at pickup",
 					deliveryID, delivery.WeightKg, confirmedWeightKg))
@@ -526,7 +497,7 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 			)
 		}
 	} else if confirmedWeightKg > 0 {
-		// Same as declared — still persist it for audit completeness.
+		// still persist it for audit completeness.
 		if persistErr := uc.repo.UpdateConfirmedWeight(ctx, deliveryID, confirmedWeightKg); persistErr != nil {
 			uc.log.Warn("ConfirmPickup: UpdateConfirmedWeight failed — non-fatal",
 				slog.String("delivery_id", deliveryID),
@@ -559,24 +530,10 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 	return nil
 }
 
-//  ConfirmDelivery ─
 
-// ConfirmDelivery validates the customer OTP and transitions to DELIVERED.
-//
-// Outbox atomicity protocol (when uc.outbox != nil):
-//  1. BEGIN a Postgres transaction.
-//  2. Update delivery state to DELIVERED inside the transaction.
-//  3. Insert a PaymentEvent into payment_events inside the same transaction.
-//  4. COMMIT — both writes land atomically.
-//
-// If the commit fails, both writes roll back. The delivery remains IN_TRANSIT
-// and the driver can retry. No partial state ever persists.
-//
+
 // If uc.outbox is nil (payment integration not yet wired), the method falls
 // back to a plain Update — safe for development, not for production.
-//
-// After a successful call the caller must signal the client app to purge all
-// customer PII from its local storage (ephemeral data mandate).
 func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driverID, customerPIN string) error {
 	delivery, err := uc.repo.GetByID(ctx, deliveryID)
 	if err != nil {
@@ -609,13 +566,12 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 		return err
 	}
 
-	//  Atomic outbox write ─
+	//  Atomic outbox write
 	if uc.outbox != nil && uc.pool != nil {
 		if err := uc.confirmDeliveryWithOutbox(ctx, delivery, prevState); err != nil {
 			return err
 		}
 	} else {
-		// Fallback: no outbox configured — plain update (dev/test only).
 		uc.log.Warn("ConfirmDelivery: outbox not configured — using plain update (payment not guaranteed)",
 			slog.String("delivery_id", deliveryID),
 		)
@@ -630,15 +586,9 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 		slog.String("delivery_id", deliveryID),
 	)
 
-	//  Task 6: Bayesian rolling rating update 
-	// Update the driver's rating using a Bayesian rolling average so that new
-	// drivers (low total_deliveries) don't immediately dominate the ranking.
-	// Formula: new_rating = (old_rating × total + 5.0) / (total + 1)
-	// where 5.0 is the "prior" score for a successful delivery.
-	// On dispute or cancellation the caller should pass a lower score.
-	uc.updateDriverRating(ctx, driverID, 5.0) // 5.0 = successful delivery score
+	//Bayesian rolling rating update(for drivers' rankings and ratings) 
+	uc.updateDriverRating(ctx, driverID, 5.0) 
 
-	// Release driver back to ACTIVE now that the trip is complete.
 	if err := uc.driverRepo.SetOnTrip(ctx, driverID, false); err != nil {
 		uc.log.Error("ConfirmDelivery: SetOnTrip(false) failed",
 			slog.String("delivery_id", deliveryID),
@@ -650,8 +600,6 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 	return nil
 }
 
-// confirmDeliveryWithOutbox runs the atomic transaction that updates the
-// delivery state and inserts the payment outbox event in one commit.
 func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 	ctx context.Context,
 	delivery *domain.Delivery,
@@ -662,7 +610,6 @@ func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 		return fmt.Errorf("ConfirmDelivery: begin tx: %w", err)
 	}
 	defer func() {
-		// Rollback is a no-op after a successful Commit.
 		if rbErr := tx.Rollback(ctx); rbErr != nil {
 			uc.log.Warn("ConfirmDelivery: tx rollback",
 				slog.String("delivery_id", delivery.ID),
@@ -670,16 +617,14 @@ func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 			)
 		}
 	}()
-
-	// Wrap pgx.Tx in the domain.Tx adapter
 	domainTx := wrapPgxTx(tx)
 
-	// 1. Update delivery state inside the transaction
+	// Update delivery state inside the transaction
 	if err := uc.repo.UpdateWithinTx(ctx, domainTx, delivery); err != nil {
 		return err
 	}
 
-	// 2. Insert payment outbox event inside the same transaction
+	// Insert payment outbox event inside the same transaction
 	// AmountRWF is 0 here — the actual fare calculation will be implemented
 	// when the pricing service is wired in. The worker will skip events with
 	// amount = 0 and re-queue them until pricing is resolved.
@@ -703,7 +648,7 @@ func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 		return fmt.Errorf("ConfirmDelivery: outbox insert: %w", err)
 	}
 
-	// 3. Commit both writes atomically
+	// Commit both writes atomically
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("ConfirmDelivery: commit: %w", err)
 	}
@@ -714,8 +659,6 @@ func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 
 	return nil
 }
-
-//  RaiseDispute ─
 
 // RaiseDispute transitions an IN_TRANSIT delivery to DISPUTED state.
 // The reason string is persisted in the audit ledger for dispatcher review.
@@ -743,7 +686,7 @@ func (uc *DeliveryUsecase) RaiseDispute(ctx context.Context, deliveryID, actorID
 	uc.appendAudit(ctx, deliveryID, actorID, "DISPUTE_RAISED",
 		string(prevState), string(domain.StateDisputed), reason)
 
-	// Task 9: Emit dispute trust signal against the driver (most likely responsible).
+	//Emit dispute trust signal against the driver
 	if delivery.DriverID != "" {
 		uc.emitTrustSignal(ctx, delivery.DriverID, "DRIVER", domain.SignalDisputeRaised, 3,
 			fmt.Sprintf("dispute on delivery %s: %s", deliveryID, reason))
@@ -752,33 +695,26 @@ func (uc *DeliveryUsecase) RaiseDispute(ctx context.Context, deliveryID, actorID
 	return nil
 }
 
-//  GetDelivery ─
-
-// GetDelivery returns a single delivery by ID. The caller must enforce
-// access control (e.g. only the assigned driver or the owning merchant).
+// GetDelivery returns a single delivery by ID.
 func (uc *DeliveryUsecase) GetDelivery(ctx context.Context, id string) (*domain.Delivery, error) {
 	return uc.repo.GetByID(ctx, id)
 }
 
-// ListDriverDeliveries returns active deliveries for a driver.
+// Returns active deliveries for a driver.
 func (uc *DeliveryUsecase) ListDriverDeliveries(
 	ctx context.Context, driverID string, states []domain.DeliveryState,
 ) ([]*domain.Delivery, error) {
 	return uc.repo.ListByDriver(ctx, driverID, states)
 }
 
-// ListMerchantDeliveries returns deliveries for a merchant.
+// Returns deliveries for a merchant.
 func (uc *DeliveryUsecase) ListMerchantDeliveries(
 	ctx context.Context, merchantID string, states []domain.DeliveryState,
 ) ([]*domain.Delivery, error) {
 	return uc.repo.ListByMerchant(ctx, merchantID, states)
 }
 
-//  Audit helpers ─
-
-// appendAudit writes to the ledger and swallows the error after logging.
-// Ledger writes must never abort a successful business operation — audit
-// failures are surfaced through monitoring, not returned to callers.
+//  Audit helpers 
 func (uc *DeliveryUsecase) appendAudit(
 	ctx context.Context,
 	entityID, actorID, action, oldState, newState, meta string,
@@ -803,9 +739,6 @@ func (uc *DeliveryUsecase) appendAudit(
 	}
 }
 
-//  Crypto helpers 
-
-// generateSecureToken produces a cryptographically random lowercase hex string.
 func generateSecureToken(nBytes int) (string, error) {
 	b := make([]byte, nBytes)
 	if _, err := rand.Read(b); err != nil {
@@ -814,8 +747,6 @@ func generateSecureToken(nBytes int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// generateNumericPIN returns a zero-padded N-digit numeric OTP.
-// Each digit is independently drawn from crypto/rand to avoid modulo bias.
 func generateNumericPIN(digits int) string {
 	b := make([]byte, digits)
 	_, _ = rand.Read(b)
@@ -851,14 +782,8 @@ func wrapPgxTx(tx pgx.Tx) domain.Tx {
 	return &pgxTxWrapper{inner: tx}
 }
 
-//  Rating & trust helpers (tasks 6 & 9) ─
+// Rating & trust helpers
 
-// updateDriverRating applies a Bayesian rolling average to the driver's rating.
-// deliveryScore: 5.0 = successful, 2.0 = disputed, 1.0 = escalated complaint.
-//
-// Formula: new_rating = (old_rating × total_deliveries + deliveryScore) / (total + 1)
-// This discounts a single bad delivery heavily for new drivers (few data points)
-// and barely nudges a veteran driver (many data points) — which is correct.
 func (uc *DeliveryUsecase) updateDriverRating(ctx context.Context, driverID string, deliveryScore float64) {
 	p, err := uc.driverRepo.GetByUserID(ctx, driverID)
 	if err != nil {
@@ -870,7 +795,6 @@ func (uc *DeliveryUsecase) updateDriverRating(ctx context.Context, driverID stri
 	}
 	newTotal := p.TotalDeliveries + 1
 	newRating := (p.Rating*float64(p.TotalDeliveries) + deliveryScore) / float64(newTotal)
-	// Clamp to [1.0, 5.0]
 	if newRating > 5.0 {
 		newRating = 5.0
 	}
@@ -893,9 +817,6 @@ func (uc *DeliveryUsecase) updateDriverRating(ctx context.Context, driverID stri
 	}
 }
 
-// emitTrustSignal appends a fraud/quality event to the trust ledger.
-// Failures are logged and swallowed — trust signals must never abort a
-// successful business operation.
 func (uc *DeliveryUsecase) emitTrustSignal(
 	ctx context.Context,
 	actorID, actorType, signalType string,

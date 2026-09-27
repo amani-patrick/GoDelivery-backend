@@ -1,7 +1,3 @@
-// Package repository contains the PostgreSQL + PostGIS implementations of every
-// domain repository interface. All SQL is parameterised — no string interpolation
-// of user-controlled input. Cross-module database writes are strictly forbidden;
-// each module owns only its own tables.
 package repository
 
 import (
@@ -17,10 +13,16 @@ import (
 	"github.com/umurinzi/backend/internal/domain"
 )
 
+// Package repository contains the PostgreSQL + PostGIS implementations of every
+// domain repository interface. All SQL is parameterised — no string interpolation
+// of user-controlled input. Cross-module database writes are strictly forbidden;
+// each module owns only its own tables.
+
+
 // pgUniqueViolation is the PostgreSQL SQLSTATE code for a unique constraint violation.
 const pgUniqueViolation = "23505"
 
-// ── DeliveryPostgresRepo ──────────────────────────────────────────────────────
+// DeliveryPostgresRepo
 
 // DeliveryPostgresRepo is the concrete PostgreSQL implementation of
 // domain.DeliveryRepository. It interacts only with the `deliveries` table.
@@ -323,7 +325,7 @@ func (r *DeliveryPostgresRepo) UpdateStackInfo(ctx context.Context, deliveryID, 
 	return nil
 }
 
-// ── internal helpers ──────────────────────────────────────────────────────────
+// internal helpers
 
 func (r *DeliveryPostgresRepo) queryList(
 	ctx context.Context,

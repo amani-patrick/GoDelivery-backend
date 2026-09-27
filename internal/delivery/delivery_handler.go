@@ -37,13 +37,10 @@ type graphQLError struct {
 	Extensions map[string]any `json:"extensions,omitempty"`
 }
 
-//Context keys
 
 type handlerCtxKey string
 
 const ctxIdempotencyKey handlerCtxKey = "idempotency_key"
-
-//Handler
 
 // Handler is the single HTTP entry point for all GraphQL operations.
 // It reads usecase interfaces only: no direct repository or Redis access.
@@ -54,7 +51,6 @@ type Handler struct {
 	log        *slog.Logger
 }
 
-// NewHandler constructs the GraphQL handler with all usecase dependencies.
 func NewHandler(
 	deliveryUC *usecase.DeliveryUsecase,
 	authUC *usecase.AuthUsecase,
@@ -69,7 +65,6 @@ func NewHandler(
 	}
 }
 
-// ServeHTTP is the single HTTP entry point for all GraphQL operations.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -113,7 +108,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// route dispatches to the correct resolver by operationName.
 func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	vars := req.Variables
 	if vars == nil {
@@ -122,13 +116,13 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 
 	switch req.OpName {
 
-	//Public (no JWT) ───────────────────────────────────────────────────────
+	//Public 
 	case "Register":
 		return h.resolveRegister(ctx, vars)
 	case "Login":
 		return h.resolveLogin(ctx, vars)
 
-	//Delivery lifecycle ────────────────────────────────────────────────────
+	//Delivery lifecycle 
 	case "CreateDelivery":
 		return h.resolveCreateDelivery(ctx, vars)
 	case "AcceptOrder":
@@ -146,7 +140,7 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	case "MerchantDeliveries":
 		return h.resolveMerchantDeliveries(ctx, vars)
 
-	//Driver registration & admin ───────────────────────────────────────────
+	//Driver registration & admin 
 	case "RegisterDriver":
 		return h.resolveRegisterDriver(ctx, vars)
 	case "ApproveDriver":
@@ -162,13 +156,13 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	case "FindEligibleDrivers":
 		return h.resolveFindEligibleDrivers(ctx, vars)
 
-	//Business / merchant profile ───────────────────────────────────────────
+	//Business / merchant profile 
 	case "UpsertBusinessProfile":
 		return h.resolveUpsertBusinessProfile(ctx, vars)
 	case "GetBusinessProfile":
 		return h.resolveGetBusinessProfile(ctx, vars)
 
-	//Customer profile ──────────────────────────────────────────────────────
+	//Customer profile 
 	case "UpdateCustomerLocation":
 		return h.resolveUpdateCustomerLocation(ctx, vars)
 
@@ -177,7 +171,7 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	}
 }
 
-//Auth resolvers ────────────────────────────────────────────────────────────
+//Auth resolvers 
 
 func (h *Handler) resolveRegister(ctx context.Context, vars map[string]any) (any, error) {
 	input, err := requireInputMap(vars)
@@ -212,7 +206,7 @@ func (h *Handler) resolveLogin(ctx context.Context, vars map[string]any) (any, e
 	return map[string]any{"token": result.Token, "user": marshalUser(result.User)}, nil
 }
 
-//Delivery resolvers ────────────────────────────────────────────────────────
+//Delivery resolvers 
 
 func (h *Handler) resolveCreateDelivery(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -293,13 +287,13 @@ func (h *Handler) resolveConfirmPickup(ctx context.Context, vars map[string]any)
 	// (used by legacy client versions that don't have a scale).
 	confirmedWeightKg := float64From(vars, "confirmedWeightKg")
 
-	if err := h.deliveryUC.ConfirmPickup(ctx, deliveryID, driverID, scannedToken, confirmedWeightKg); err != nil {
+	if Pickup(ctx, deliveryID, driverID, scannedToken, confirmedWeightKg); err != nil {
 		h.log.Warn("ConfirmPickup failed",
 			slog.String("delivery_id", deliveryID),
 			slog.String("driver_id", driverID),
 			slog.String("reason", err.Error()),
 		)
-		return nil, err
+		return nil, errerr := h.deliveryUC.Confirm
 	}
 	return h.fetchAndMarshal(ctx, deliveryID)
 }
@@ -390,7 +384,7 @@ func (h *Handler) resolveMerchantDeliveries(ctx context.Context, vars map[string
 	return marshalDeliveries(deliveries), nil
 }
 
-//Driver resolvers ──────────────────────────────────────────────────────────
+//Driver resolvers
 
 func (h *Handler) resolveRegisterDriver(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -505,9 +499,6 @@ func (h *Handler) resolveFindEligibleDrivers(ctx context.Context, vars map[strin
 		return nil, err
 	}
 
-	// NearbyDriverIDs must be provided by the caller from the client-side
-	// Redis geo query result (lat/lng → SpatialIndex.FindNearbyDrivers).
-	// The handler accepts them as a JSON array variable.
 	candidateIDs := stringSliceFromVars(vars, "nearbyDriverIds")
 
 	candidates, err := h.driverUC.FindEligibleDrivers(ctx, usecase.FindEligibleDriversInput{
@@ -522,7 +513,7 @@ func (h *Handler) resolveFindEligibleDrivers(ctx context.Context, vars map[strin
 	return marshalDispatchCandidates(candidates), nil
 }
 
-//Business profile resolvers ────────────────────────────────────────────────
+//Business profile resolvers
 
 func (h *Handler) resolveUpsertBusinessProfile(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -562,7 +553,7 @@ func (h *Handler) resolveGetBusinessProfile(ctx context.Context, vars map[string
 	return marshalBusinessProfile(profile), nil
 }
 
-//Customer profile resolvers ────────────────────────────────────────────────
+//Customer profile resolvers 
 
 func (h *Handler) resolveUpdateCustomerLocation(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -577,7 +568,7 @@ func (h *Handler) resolveUpdateCustomerLocation(ctx context.Context, vars map[st
 	return map[string]any{"lat": lat, "lng": lng}, nil
 }
 
-//Auth helper ───────────────────────────────────────────────────────────────
+//Auth helper 
 
 func (h *Handler) requireAuth(ctx context.Context) (string, error) {
 	userID, ok := ctx.Value(middleware.CtxUserID).(string)
@@ -587,7 +578,7 @@ func (h *Handler) requireAuth(ctx context.Context) (string, error) {
 	return userID, nil
 }
 
-//Error classification ──────────────────────────────────────────────────────
+//Error classification 
 
 func (h *Handler) classifyError(err error) map[string]any {
 	ext := map[string]any{}
@@ -636,7 +627,7 @@ func (h *Handler) writeError(w http.ResponseWriter, status int, msg string) {
 	})
 }
 
-//Marshal helpers ───────────────────────────────────────────────────────────
+//Marshal helpers 
 
 func (h *Handler) fetchAndMarshal(ctx context.Context, deliveryID string) (any, error) {
 	d, err := h.deliveryUC.GetDelivery(ctx, deliveryID)
@@ -721,7 +712,7 @@ func marshalBusinessProfile(p *domain.BusinessProfile) map[string]any {
 		},
 		"district":   p.District,
 		"isVerified": p.IsVerified,
-		// TINNumber deliberately omitted from API responses
+		// TINNumber omitted from API responses
 	}
 }
 
@@ -735,14 +726,13 @@ func marshalDispatchCandidates(cs []*domain.DispatchCandidate) []map[string]any 
 			"plateNumber": c.PlateNumber,
 			"maxWeightKg": c.MaxWeightKg,
 			"distanceKm":  c.DistanceKm,
-			// Phone deliberately omitted from dispatch list responses —
-			// only revealed to the merchant after assignment
+			// Phone - only revealed to the merchant after assignment
 		}
 	}
 	return out
 }
 
-//Variable extraction helpers ───────────────────────────────────────────────
+//Variable extraction helpers
 
 func requireInputMap(vars map[string]any) (map[string]any, error) {
 	v, ok := vars["input"]

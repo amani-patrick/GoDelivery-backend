@@ -1,5 +1,3 @@
-// Package middleware provides HTTP middleware for authentication,
-// request logging, and recovery.
 package middleware
 
 import (
@@ -30,18 +28,11 @@ const (
 	CtxUserRole ContextKey = "role"
 )
 
-// ── JWT claims ────────────────────────────────────────────────────────────────
-
-// Claims is the strictly-typed JWT payload validated by JWTMiddleware.
-// It mirrors the Claims struct in the auth usecase; both use the same field
-// names so a token issued by the usecase is validated correctly here.
 type Claims struct {
 	UserID string      `json:"uid"`
 	Role   domain.Role `json:"role"`
 	jwt.RegisteredClaims
 }
-
-// ── JWTMiddleware ─────────────────────────────────────────────────────────────
 
 // JWTMiddleware validates the Authorization: Bearer <token> header and injects
 // the parsed claims into the request context under the exported CtxUserID and
@@ -68,9 +59,6 @@ func JWTMiddleware(secret string) func(http.Handler) http.Handler {
 				writeUnauthorized(w, "invalid or expired token")
 				return
 			}
-
-			// Inject using the exported ContextKey type — every downstream package
-			// that reads these values must use the same type to get a non-nil result.
 			ctx := context.WithValue(r.Context(), CtxUserID, claims.UserID)
 			ctx = context.WithValue(ctx, CtxUserRole, string(claims.Role))
 
@@ -120,8 +108,6 @@ func Recovery(log *slog.Logger) func(http.Handler) http.Handler {
 		})
 	}
 }
-
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 func writeUnauthorized(w http.ResponseWriter, msg string) {
 	w.Header().Set("Content-Type", "application/json")
