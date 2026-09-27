@@ -1,0 +1,5 @@
+BEGIN;
+DROP INDEX IF EXISTS users_phone_uniq;
+DROP INDEX IF EXISTS users_id_idx;
+DROP TABLE IF EXISTS users;
+COMMIT;

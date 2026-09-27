@@ -1,0 +1,163 @@
+"""
+Umurinzi GraphQL Schema
+All mutations that touch sensitive tokens operate over TLS only.
+PII fields (phone, addresses) are never returned in list queries.
+"""
+
+scalar Time
+
+# ── Enums ────────────────────────────────────────────────────────────────────
+
+enum DeliveryState {
+  CREATED
+  ASSIGNED
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+  DISPUTED
+}
+
+enum Role {
+  MERCHANT
+  DRIVER
+  CUSTOMER
+  DISPATCHER
+}
+
+# ── Types ─────────────────────────────────────────────────────────────────────
+
+type Location {
+  lat: Float!
+  lng: Float!
+}
+
+type Delivery {
+  id: ID!
+  merchantId: String!
+  driverId: String
+  customerId: String!
+  currentState: DeliveryState!
+  pickupLocation: Location!
+  dropoffLocation: Location!
+  description: String!
+  weightKg: Float!
+  createdAt: Time!
+  updatedAt: Time!
+}
+
+type User {
+  id: ID!
+  fullName: String!
+  phone: String!
+  role: Role!
+  isActive: Boolean!
+  isVerified: Boolean!
+  createdAt: Time!
+}
+
+"""
+CreateDeliveryResult returns the delivery plus one-time-use plaintext tokens.
+The plaintextQrCode is shown to the merchant ONCE for QR printing.
+The plaintextPin is sent to the customer ONCE via SMS.
+Neither value is ever stored in plaintext.
+"""
+type CreateDeliveryResult {
+  delivery: Delivery!
+  plaintextQrCode: String!
+  plaintextPin: String!
+}
+
+type AuthResult {
+  token: String!
+  user: User!
+}
+
+type AuditEvent {
+  id: ID!
+  entityId: String!
+  entityType: String!
+  actorId: String!
+  action: String!
+  oldState: String
+  newState: String
+  metadata: String
+  createdAt: Time!
+}
+
+# ── Inputs ───────────────────────────────────────────────────────────────────
+
+input LocationInput {
+  lat: Float!
+  lng: Float!
+}
+
+input CreateDeliveryInput {
+  customerPhone: String!
+  pickupLocation: LocationInput!
+  dropoffLocation: LocationInput!
+  description: String!
+  weightKg: Float!
+}
+
+input RegisterInput {
+  fullName: String!
+  phone: String!
+  email: String
+  password: String!
+  role: Role!
+}
+
+input LoginInput {
+  phone: String!
+  password: String!
+}
+
+# ── Queries ──────────────────────────────────────────────────────────────────
+
+type Query {
+  """Get a single delivery by ID. Requires authentication."""
+  delivery(id: ID!): Delivery
+
+  """List deliveries for the authenticated driver."""
+  myDeliveries(states: [DeliveryState!]): [Delivery!]!
+
+  """List deliveries for the authenticated merchant."""
+  merchantDeliveries(states: [DeliveryState!]): [Delivery!]!
+
+  """Dispatcher-only: full audit trail for an entity."""
+  auditLog(entityId: ID!): [AuditEvent!]!
+}
+
+# ── Mutations ────────────────────────────────────────────────────────────────
+
+type Mutation {
+  """Register a new user account."""
+  register(input: RegisterInput!): AuthResult!
+
+  """Authenticate and receive a JWT."""
+  login(input: LoginInput!): AuthResult!
+
+  """
+  Merchant creates a new delivery order.
+  Returns one-time-use tokens for QR code and customer PIN.
+  """
+  createDelivery(input: CreateDeliveryInput!): CreateDeliveryResult!
+
+  """Driver accepts an unassigned delivery."""
+  acceptOrder(deliveryId: ID!): Delivery!
+
+  """
+  Driver confirms physical package pickup by scanning the merchant QR code.
+  Custody and legal liability transfer to driver on success.
+  """
+  confirmPickup(deliveryId: ID!, scannedToken: String!): Delivery!
+
+  """
+  Driver confirms delivery completion using customer OTP.
+  Triggers PII ephemeral purge on the driver app.
+  """
+  confirmDelivery(deliveryId: ID!, customerPin: String!): Delivery!
+
+  """Any authorised actor can raise a dispute on an in-transit delivery."""
+  raiseDispute(deliveryId: ID!, reason: String!): Delivery!
+}

@@ -1,0 +1,53 @@
+
+# Go binaries / build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/build/
+/dist/
+
+# Go tooling
+coverage.out
+*.prof
+
+# Dependencies / caches
+vendor/
+go.work
+go.work.sum
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker overrides / local data
+docker-compose.override.yml
+
+# Database/local development data
+*.db
+*.sqlite
+*.sqlite3

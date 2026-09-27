@@ -1,0 +1,10 @@
+BEGIN;
+DROP TRIGGER  IF EXISTS audit_events_no_delete ON audit_events;
+DROP TRIGGER  IF EXISTS audit_events_no_update ON audit_events;
+DROP FUNCTION IF EXISTS audit_events_immutability_guard();
+DROP INDEX    IF EXISTS audit_events_created_at_idx;
+DROP INDEX    IF EXISTS audit_events_action_idx;
+DROP INDEX    IF EXISTS audit_events_actor_time_idx;
+DROP INDEX    IF EXISTS audit_events_entity_time_idx;
+DROP TABLE    IF EXISTS audit_events;
+COMMIT;

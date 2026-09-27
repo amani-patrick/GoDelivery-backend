@@ -1,0 +1,118 @@
+# Umurinzi local development stack
+#
+# Services:
+#   postgres  — PostgreSQL 16 + PostGIS 3.4 (primary datastore)
+#   redis     — Redis 7 (spatial index, distributed locks, frame buffers)
+#   backend   — Go server (built from source via Dockerfile)
+#
+# Usage:
+#   cp .env.example .env          # fill in JWT_SECRET
+#   docker compose up --build     # first run
+#   docker compose up             # subsequent runs
+#   docker compose down -v        # destroy volumes (wipes DB)
+
+services:
+
+  # ── PostgreSQL + PostGIS ────────────────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: umurinzi_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       umurinzi
+      POSTGRES_USER:     umurinzi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umurinzi -d umurinzi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: umurinzi_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Migrate (one-shot) ──────────────────────────────────────────────────────
+  # Runs all .up.sql files in order then exits.
+  # Depends on postgres being healthy so it never races the DB.
+  migrate:
+    image: migrate/migrate:v4.17.1
+    container_name: umurinzi_migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command: >
+      -path=/migrations
+      -database=postgres://umurinzi:${POSTGRES_PASSWORD:-secret}@postgres:5432/umurinzi?sslmode=disable
+      up
+    restart: on-failure
+
+  # ── Backend ─────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: umurinzi_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PORT:               ${PORT:-8080}
+      SHUTDOWN_TIMEOUT_SECS: ${SHUTDOWN_TIMEOUT_SECS:-30}
+
+      DATABASE_URL:       postgres://umurinzi:${POSTGRES_PASSWORD:-secret}@postgres:5432/umurinzi?sslmode=disable
+      DB_MAX_CONNS:       ${DB_MAX_CONNS:-25}
+      DB_MIN_CONNS:       ${DB_MIN_CONNS:-5}
+      DB_MAX_CONN_LIFETIME_MINS: ${DB_MAX_CONN_LIFETIME_MINS:-30}
+
+      REDIS_ADDR:         redis:6379
+      REDIS_PASSWORD:     ${REDIS_PASSWORD:-}
+      REDIS_DB:           ${REDIS_DB:-0}
+
+      JWT_SECRET:         ${JWT_SECRET}
+      JWT_EXPIRY_HOURS:   ${JWT_EXPIRY_HOURS:-24}
+      BCRYPT_COST:        ${BCRYPT_COST:-12}
+
+      ANOMALY_STATIONARY_MINUTES:  ${ANOMALY_STATIONARY_MINUTES:-5}
+      ANOMALY_DEVIATION_METERS:    ${ANOMALY_DEVIATION_METERS:-300}
+      ANOMALY_PANIC_BUFFER_SIZE:   ${ANOMALY_PANIC_BUFFER_SIZE:-30}
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT:-8080}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres_data:
+    driver: local
