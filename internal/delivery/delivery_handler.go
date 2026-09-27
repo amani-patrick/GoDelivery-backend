@@ -1,10 +1,4 @@
-// Package delivery exposes the GraphQL HTTP handler for the full delivery lifecycle.
-// It depends only on usecase types — never on repository implementations directly.
-//
-// Operation routing: the handler reads operationName from the JSON request body.
-// For the two public auth routes (/auth/register, /auth/login) main.go injects
-// the operation name via the X-Gql-Operation header so those routes can bypass
-// the JWT middleware while still reusing this handler.
+
 package delivery
 
 import (
@@ -22,7 +16,10 @@ import (
 	"github.com/umurinzi/backend/internal/middleware"
 )
 
-// ── Wire types ────────────────────────────────────────────────────────────────
+// Operation routing: the handler reads operationName from the JSON request body.
+// For the two public auth routes (/auth/register, /auth/login) main.go injects
+// the operation name via the X-Gql-Operation header so those routes can bypass
+// the JWT middleware while still reusing this handler.
 
 type graphQLRequest struct {
 	Query     string         `json:"query"`
@@ -40,16 +37,16 @@ type graphQLError struct {
 	Extensions map[string]any `json:"extensions,omitempty"`
 }
 
-// ── Context keys ──────────────────────────────────────────────────────────────
+//Context keys
 
 type handlerCtxKey string
 
 const ctxIdempotencyKey handlerCtxKey = "idempotency_key"
 
-// ── Handler ───────────────────────────────────────────────────────────────────
+//Handler
 
 // Handler is the single HTTP entry point for all GraphQL operations.
-// It reads usecase interfaces only — no direct repository or Redis access.
+// It reads usecase interfaces only: no direct repository or Redis access.
 type Handler struct {
 	deliveryUC *usecase.DeliveryUsecase
 	authUC     *usecase.AuthUsecase
@@ -125,13 +122,13 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 
 	switch req.OpName {
 
-	// ── Public (no JWT) ───────────────────────────────────────────────────────
+	//Public (no JWT) ───────────────────────────────────────────────────────
 	case "Register":
 		return h.resolveRegister(ctx, vars)
 	case "Login":
 		return h.resolveLogin(ctx, vars)
 
-	// ── Delivery lifecycle ────────────────────────────────────────────────────
+	//Delivery lifecycle ────────────────────────────────────────────────────
 	case "CreateDelivery":
 		return h.resolveCreateDelivery(ctx, vars)
 	case "AcceptOrder":
@@ -149,7 +146,7 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	case "MerchantDeliveries":
 		return h.resolveMerchantDeliveries(ctx, vars)
 
-	// ── Driver registration & admin ───────────────────────────────────────────
+	//Driver registration & admin ───────────────────────────────────────────
 	case "RegisterDriver":
 		return h.resolveRegisterDriver(ctx, vars)
 	case "ApproveDriver":
@@ -165,13 +162,13 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	case "FindEligibleDrivers":
 		return h.resolveFindEligibleDrivers(ctx, vars)
 
-	// ── Business / merchant profile ───────────────────────────────────────────
+	//Business / merchant profile ───────────────────────────────────────────
 	case "UpsertBusinessProfile":
 		return h.resolveUpsertBusinessProfile(ctx, vars)
 	case "GetBusinessProfile":
 		return h.resolveGetBusinessProfile(ctx, vars)
 
-	// ── Customer profile ──────────────────────────────────────────────────────
+	//Customer profile ──────────────────────────────────────────────────────
 	case "UpdateCustomerLocation":
 		return h.resolveUpdateCustomerLocation(ctx, vars)
 
@@ -180,7 +177,7 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	}
 }
 
-// ── Auth resolvers ────────────────────────────────────────────────────────────
+//Auth resolvers ────────────────────────────────────────────────────────────
 
 func (h *Handler) resolveRegister(ctx context.Context, vars map[string]any) (any, error) {
 	input, err := requireInputMap(vars)
@@ -215,7 +212,7 @@ func (h *Handler) resolveLogin(ctx context.Context, vars map[string]any) (any, e
 	return map[string]any{"token": result.Token, "user": marshalUser(result.User)}, nil
 }
 
-// ── Delivery resolvers ────────────────────────────────────────────────────────
+//Delivery resolvers ────────────────────────────────────────────────────────
 
 func (h *Handler) resolveCreateDelivery(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -393,7 +390,7 @@ func (h *Handler) resolveMerchantDeliveries(ctx context.Context, vars map[string
 	return marshalDeliveries(deliveries), nil
 }
 
-// ── Driver resolvers ──────────────────────────────────────────────────────────
+//Driver resolvers ──────────────────────────────────────────────────────────
 
 func (h *Handler) resolveRegisterDriver(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -525,7 +522,7 @@ func (h *Handler) resolveFindEligibleDrivers(ctx context.Context, vars map[strin
 	return marshalDispatchCandidates(candidates), nil
 }
 
-// ── Business profile resolvers ────────────────────────────────────────────────
+//Business profile resolvers ────────────────────────────────────────────────
 
 func (h *Handler) resolveUpsertBusinessProfile(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -565,7 +562,7 @@ func (h *Handler) resolveGetBusinessProfile(ctx context.Context, vars map[string
 	return marshalBusinessProfile(profile), nil
 }
 
-// ── Customer profile resolvers ────────────────────────────────────────────────
+//Customer profile resolvers ────────────────────────────────────────────────
 
 func (h *Handler) resolveUpdateCustomerLocation(ctx context.Context, vars map[string]any) (any, error) {
 	callerID, err := h.requireAuth(ctx)
@@ -580,7 +577,7 @@ func (h *Handler) resolveUpdateCustomerLocation(ctx context.Context, vars map[st
 	return map[string]any{"lat": lat, "lng": lng}, nil
 }
 
-// ── Auth helper ───────────────────────────────────────────────────────────────
+//Auth helper ───────────────────────────────────────────────────────────────
 
 func (h *Handler) requireAuth(ctx context.Context) (string, error) {
 	userID, ok := ctx.Value(middleware.CtxUserID).(string)
@@ -590,7 +587,7 @@ func (h *Handler) requireAuth(ctx context.Context) (string, error) {
 	return userID, nil
 }
 
-// ── Error classification ──────────────────────────────────────────────────────
+//Error classification ──────────────────────────────────────────────────────
 
 func (h *Handler) classifyError(err error) map[string]any {
 	ext := map[string]any{}
@@ -639,7 +636,7 @@ func (h *Handler) writeError(w http.ResponseWriter, status int, msg string) {
 	})
 }
 
-// ── Marshal helpers ───────────────────────────────────────────────────────────
+//Marshal helpers ───────────────────────────────────────────────────────────
 
 func (h *Handler) fetchAndMarshal(ctx context.Context, deliveryID string) (any, error) {
 	d, err := h.deliveryUC.GetDelivery(ctx, deliveryID)
@@ -745,7 +742,7 @@ func marshalDispatchCandidates(cs []*domain.DispatchCandidate) []map[string]any 
 	return out
 }
 
-// ── Variable extraction helpers ───────────────────────────────────────────────
+//Variable extraction helpers ───────────────────────────────────────────────
 
 func requireInputMap(vars map[string]any) (map[string]any, error) {
 	v, ok := vars["input"]

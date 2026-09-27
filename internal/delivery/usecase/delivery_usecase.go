@@ -1,8 +1,3 @@
-// Package usecase orchestrates the delivery lifecycle application logic.
-// It coordinates domain rules, distributed locking, and persistence —
-// never touching the database directly; always through repository interfaces.
-// Cross-module communication happens through Go channels or explicit interface
-// calls — never through direct cross-module database writes.
 package usecase
 
 import (
@@ -23,7 +18,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// Package usecase orchestrates the delivery lifecycle application logic.
+// It coordinates domain rules, distributed locking, and persistence —
+// never touching the database directly; always through repository interfaces.
+// Cross-module communication happens through Go channels or explicit interface
+// calls — never through direct cross-module database writes.
+
+// Constants 
 
 const (
 	lockTTL           = 5 * time.Second  // Redis NX lock expiry — prevents deadlock on crash
@@ -33,13 +34,8 @@ const (
 	idempotencyPrefix = "idem:create:"   // Redis key prefix for idempotency records
 )
 
-// luaReleaseLock is a Lua script that atomically checks the lock value before
-// deleting it. This prevents a late-running goroutine from releasing a lock
-// that was already expired and re-acquired by a different driver.
-//
-// KEYS[1] = lock key
-// ARGV[1] = expected value (driverID set when the lock was acquired)
-//
+
+
 // Returns 1 if the key was deleted (we owned it), 0 if not (already expired/stolen).
 const luaReleaseLock = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -59,27 +55,22 @@ type DispatchEnqueuerFunc func(
 	vehicleTypeRequired domain.VehicleType,
 ) error
 
-// ── DeliveryUsecase ───────────────────────────────────────────────────────────
-
-// DeliveryUsecase orchestrates all delivery lifecycle operations.
+//DeliveryUsecase orchestrates all delivery lifecycle operations.
 type DeliveryUsecase struct {
 	repo             domain.DeliveryRepository
 	driverRepo       domain.DriverProfileRepository
 	outbox           domain.OutboxRepository
-	trustRepo        domain.TrustRepository    // nil when not wired
+	trustRepo        domain.TrustRepository    //nil when not wired
 	ledger           domain.LedgerRepository
 	redisClient      *redis.Client
 	pool             *pgxpool.Pool
 	bcryptCost       int
 	dispatchEnqueuer DispatchEnqueuerFunc
-	clearPending     func(ctx context.Context, deliveryID string) // task 1 — clear re-dispatch key
-	getIntended      func(ctx context.Context, deliveryID string) string // task 2 — intended winner check
+	clearPending     func(ctx context.Context, deliveryID string) 
+	getIntended      func(ctx context.Context, deliveryID string) string
 	log              *slog.Logger
 }
 
-// NewDeliveryUsecase constructs the usecase with injected dependencies.
-// outbox, trustRepo, clearPending, and getIntended may all be nil — when nil
-// the corresponding feature is silently skipped.
 func NewDeliveryUsecase(
 	repo domain.DeliveryRepository,
 	driverRepo domain.DriverProfileRepository,
@@ -110,9 +101,7 @@ func NewDeliveryUsecase(
 	}
 }
 
-// ── DTOs ──────────────────────────────────────────────────────────────────────
-
-// CreateDeliveryInput carries the caller-supplied creation parameters.
+//CreateDeliveryInput carries the caller-supplied creation parameters.
 type CreateDeliveryInput struct {
 	MerchantID          string
 	CustomerID          string
@@ -122,7 +111,7 @@ type CreateDeliveryInput struct {
 	DropoffLng          float64
 	Description         string
 	WeightKg            float64
-	VehicleTypeRequired domain.VehicleType   // empty = any type acceptable
+	VehicleTypeRequired domain.VehicleType   //empty for any type 
 	PackageCategory     domain.PackageCategory
 	// IdempotencyKey is optional. When provided and a matching record exists in
 	// Redis, the original Delivery is returned without creating a new one.
@@ -150,7 +139,7 @@ type idempotencyRecord struct {
 	DeliveryID string `json:"delivery_id"`
 }
 
-// ── CreateDelivery ────────────────────────────────────────────────────────────
+//  CreateDelivery 
 
 // CreateDelivery generates the cryptographic custody tokens, hashes them,
 // persists the aggregate, and returns the one-time plaintext values to the caller.
@@ -167,7 +156,7 @@ type idempotencyRecord struct {
 func (uc *DeliveryUsecase) CreateDelivery(
 	ctx context.Context, in CreateDeliveryInput,
 ) (*CreateDeliveryOutput, error) {
-	// ── Idempotency cache lookup ───────────────────────────────────────────────
+	//  Idempotency cache lookup ─
 	if in.IdempotencyKey != "" {
 		if out, hit, err := uc.checkIdempotencyCache(ctx, in.IdempotencyKey); err != nil {
 			// Cache read failure is non-fatal — log and proceed to create.
@@ -184,7 +173,7 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		}
 	}
 
-	// ── Validate required fields ──────────────────────────────────────────────
+	//  Validate required fields 
 	if in.MerchantID == "" || in.CustomerID == "" {
 		return nil, fmt.Errorf("%w: merchant_id and customer_id are required", domain.ErrInvalidInput)
 	}
@@ -192,7 +181,7 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		return nil, fmt.Errorf("%w: weight_kg must be positive", domain.ErrInvalidInput)
 	}
 
-	// ── Generate cryptographic custody tokens ─────────────────────────────────
+	//  Generate cryptographic custody tokens ─
 	rawQR, err := generateSecureToken(qrTokenBytes)
 	if err != nil {
 		return nil, fmt.Errorf("generate qr token: %w", err)
@@ -238,7 +227,7 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		return nil, err
 	}
 
-	// ── Write idempotency record to Redis ─────────────────────────────────────
+	//  Write idempotency record to Redis ─
 	if in.IdempotencyKey != "" {
 		if err := uc.writeIdempotencyCache(ctx, in.IdempotencyKey, d.ID); err != nil {
 			uc.log.Warn("CreateDelivery: idempotency cache write failed — non-fatal",
@@ -249,7 +238,7 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		}
 	}
 
-	// ── Enqueue for batch dispatch ─────────────────────────────────────────────
+	//  Enqueue for batch dispatch 
 	// This is non-fatal — if the queue write fails the order is still persisted
 	// and can be dispatched via the immediate DispatchForDelivery path.
 	if uc.dispatchEnqueuer != nil {
@@ -318,7 +307,7 @@ func (uc *DeliveryUsecase) writeIdempotencyCache(
 	return uc.redisClient.Set(ctx, cacheKey, string(b), idempotencyTTL).Err()
 }
 
-// ── AcceptOrder ───────────────────────────────────────────────────────────────
+//  AcceptOrder ─
 
 // AcceptOrder assigns a driver to a delivery. It enforces three layers of
 // protection before writing anything:
@@ -332,7 +321,7 @@ func (uc *DeliveryUsecase) writeIdempotencyCache(
 //
 // On success the driver's status is moved to ON_TRIP.
 func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID string) error {
-	// ── Step 1: Driver eligibility check (before acquiring the lock) ──────────
+	//  Step 1: Driver eligibility check (before acquiring the lock) 
 	driverProfile, err := uc.driverRepo.GetByUserID(ctx, driverID)
 	if err != nil {
 		uc.log.Warn("AcceptOrder: driver profile not found",
@@ -362,7 +351,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		return eligErr
 	}
 
-	// ── Task 2: Concurrent acceptance guard ───────────────────────────────────
+	//  Task 2: Concurrent acceptance guard ─
 	// If the matching engine registered an intended winner and this driver is
 	// not that winner, block them while the TTL is still active.
 	// After TTL expires (getIntended returns ""), any driver may accept.
@@ -378,7 +367,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		}
 	}
 
-	// ── Step 2: Redis distributed lock ────────────────────────────────────────
+	//  Step 2: Redis distributed lock 
 	lockKey := "lock:delivery:" + deliveryID
 
 	acquired, err := uc.redisClient.SetNX(ctx, lockKey, driverID, lockTTL).Result()
@@ -415,7 +404,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		}
 	}()
 
-	// ── Step 3: Re-read delivery inside the lock and run state machine ────────
+	//  Step 3: Re-read delivery inside the lock and run state machine 
 	// Re-fetch after acquiring the lock in case the state changed between our
 	// pre-lock read and now (e.g. dispatcher cancelled the order).
 	delivery, err = uc.repo.GetByID(ctx, deliveryID)
@@ -439,7 +428,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		return err
 	}
 
-	// ── Step 4: Move driver status to ON_TRIP ─────────────────────────────────
+	//  Step 4: Move driver status to ON_TRIP ─
 	if err := uc.driverRepo.SetOnTrip(ctx, driverID, true); err != nil {
 		uc.log.Error("AcceptOrder: SetOnTrip failed — delivery assigned but driver status not updated",
 			slog.String("delivery_id", deliveryID),
@@ -448,7 +437,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 		)
 	}
 
-	// ── Task 1: Clear re-dispatch pending key ─────────────────────────────────
+	//  Task 1: Clear re-dispatch pending key ─
 	// The driver accepted — stop the re-dispatch countdown.
 	if uc.clearPending != nil {
 		uc.clearPending(ctx, deliveryID)
@@ -461,7 +450,7 @@ func (uc *DeliveryUsecase) AcceptOrder(ctx context.Context, deliveryID, driverID
 	return nil
 }
 
-// ── ConfirmPickup ─────────────────────────────────────────────────────────────
+//  ConfirmPickup ─
 
 // ConfirmPickup validates the QR token scanned by the driver, records the
 // confirmed package weight, and transitions the delivery to IN_TRANSIT.
@@ -507,7 +496,7 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 		return domain.ErrHandshakeFailed
 	}
 
-	// ── Weight fraud guard (task 5) ───────────────────────────────────────────
+	//  Weight fraud guard (task 5) ─
 	if confirmedWeightKg > 0 && confirmedWeightKg != delivery.WeightKg {
 		// Fetch driver profile to check vehicle capacity against actual weight.
 		driverProfile, err := uc.driverRepo.GetByUserID(ctx, driverID)
@@ -570,7 +559,7 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 	return nil
 }
 
-// ── ConfirmDelivery ───────────────────────────────────────────────────────────
+//  ConfirmDelivery ─
 
 // ConfirmDelivery validates the customer OTP and transitions to DELIVERED.
 //
@@ -620,7 +609,7 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 		return err
 	}
 
-	// ── Atomic outbox write ───────────────────────────────────────────────────
+	//  Atomic outbox write ─
 	if uc.outbox != nil && uc.pool != nil {
 		if err := uc.confirmDeliveryWithOutbox(ctx, delivery, prevState); err != nil {
 			return err
@@ -641,7 +630,7 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 		slog.String("delivery_id", deliveryID),
 	)
 
-	// ── Task 6: Bayesian rolling rating update ────────────────────────────────
+	//  Task 6: Bayesian rolling rating update 
 	// Update the driver's rating using a Bayesian rolling average so that new
 	// drivers (low total_deliveries) don't immediately dominate the ranking.
 	// Formula: new_rating = (old_rating × total + 5.0) / (total + 1)
@@ -726,7 +715,7 @@ func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 	return nil
 }
 
-// ── RaiseDispute ─────────────────────────────────────────────────────────────
+//  RaiseDispute ─
 
 // RaiseDispute transitions an IN_TRANSIT delivery to DISPUTED state.
 // The reason string is persisted in the audit ledger for dispatcher review.
@@ -763,7 +752,7 @@ func (uc *DeliveryUsecase) RaiseDispute(ctx context.Context, deliveryID, actorID
 	return nil
 }
 
-// ── GetDelivery ───────────────────────────────────────────────────────────────
+//  GetDelivery ─
 
 // GetDelivery returns a single delivery by ID. The caller must enforce
 // access control (e.g. only the assigned driver or the owning merchant).
@@ -785,7 +774,7 @@ func (uc *DeliveryUsecase) ListMerchantDeliveries(
 	return uc.repo.ListByMerchant(ctx, merchantID, states)
 }
 
-// ── Audit helpers ─────────────────────────────────────────────────────────────
+//  Audit helpers ─
 
 // appendAudit writes to the ledger and swallows the error after logging.
 // Ledger writes must never abort a successful business operation — audit
@@ -814,7 +803,7 @@ func (uc *DeliveryUsecase) appendAudit(
 	}
 }
 
-// ── Crypto helpers ────────────────────────────────────────────────────────────
+//  Crypto helpers 
 
 // generateSecureToken produces a cryptographically random lowercase hex string.
 func generateSecureToken(nBytes int) (string, error) {
@@ -862,7 +851,7 @@ func wrapPgxTx(tx pgx.Tx) domain.Tx {
 	return &pgxTxWrapper{inner: tx}
 }
 
-// ── Rating & trust helpers (tasks 6 & 9) ─────────────────────────────────────
+//  Rating & trust helpers (tasks 6 & 9) ─
 
 // updateDriverRating applies a Bayesian rolling average to the driver's rating.
 // deliveryScore: 5.0 = successful, 2.0 = disputed, 1.0 = escalated complaint.

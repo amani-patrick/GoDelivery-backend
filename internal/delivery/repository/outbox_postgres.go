@@ -11,7 +11,7 @@ import (
 )
 
 // OutboxPostgresRepo implements domain.OutboxRepository against the
-// payment_events table. The most critical method — CreateWithinTx — accepts
+// payment_events table. The most critical method: CreateWithinTx - accepts
 // a domain.Tx so the insert always runs inside the same transaction as the
 // delivery state update, preserving atomicity.
 //
@@ -69,7 +69,7 @@ func (r *OutboxPostgresRepo) CreateWithinTx(ctx context.Context, tx domain.Tx, e
 }
 
 // ClaimPending selects up to limit PENDING events using SELECT FOR UPDATE SKIP LOCKED,
-// marks them PROCESSING atomically, and returns them to the caller (OutboxWorker).
+// marks them PROCESSING atomically, and returns them to the OutboxWorker.
 // SKIP LOCKED ensures multiple worker instances never process the same event simultaneously.
 func (r *OutboxPostgresRepo) ClaimPending(ctx context.Context, limit int) ([]*domain.PaymentEvent, error) {
 	// Use a transaction so the UPDATE and SELECT are atomic.
@@ -178,7 +178,7 @@ func (r *OutboxPostgresRepo) MarkFailed(ctx context.Context, id, reason string) 
 }
 
 // ScheduleRetry sets the next retry time using exponential back-off.
-// The caller (OutboxWorker) computes nextRetryAt:
+// The OutboxWorker computes nextRetryAt:
 //
 //	nextRetryAt = now + (2^attempt * baseIntervalSeconds)
 func (r *OutboxPostgresRepo) ScheduleRetry(ctx context.Context, id string, nextRetryAt time.Time) error {

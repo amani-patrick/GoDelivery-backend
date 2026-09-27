@@ -13,14 +13,14 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// ── Sentinel errors ───────────────────────────────────────────────────────────
+//Sentinel errors
 
 var (
 	ErrInvalidCredentials = errors.New("invalid phone number or password")
 	ErrPhoneAlreadyExists = errors.New("phone number already registered")
 )
 
-// ── JWT claims ────────────────────────────────────────────────────────────────
+//JWT claims
 
 // Claims is the strictly-typed JWT payload. Using a concrete struct (not
 // map[string]any) ensures the compiler catches field-name typos at compile time.
@@ -38,7 +38,7 @@ type AuthConfig struct {
 	BcryptCost  int
 }
 
-// ── AuthUsecase ───────────────────────────────────────────────────────────────
+//AuthUsecase
 
 // AuthUsecase handles registration and authentication. It owns the JWT issuance
 // contract — no other layer mints tokens.
@@ -53,7 +53,7 @@ func NewAuthUsecase(userRepo domain.UserRepository, cfg AuthConfig, log *slog.Lo
 	return &AuthUsecase{userRepo: userRepo, cfg: cfg, log: log}
 }
 
-// ── DTOs ──────────────────────────────────────────────────────────────────────
+//DTOs
 
 // RegisterInput carries validated registration fields from the handler layer.
 type RegisterInput struct {
@@ -71,7 +71,7 @@ type AuthResult struct {
 	User  *domain.User
 }
 
-// ── Register ──────────────────────────────────────────────────────────────────
+//Register
 
 // Register creates a new user account. The plaintext password is hashed with
 // bcrypt before any persistence call. The hash cost is injected from config.
@@ -137,13 +137,6 @@ func (uc *AuthUsecase) Register(ctx context.Context, in RegisterInput) (*AuthRes
 	return &AuthResult{Token: token, User: u}, nil
 }
 
-// ── Login ─────────────────────────────────────────────────────────────────────
-
-// Login validates credentials and issues a JWT on success.
-//
-// Timing-attack defence: when the phone is not found we still run a bcrypt
-// compare against a dummy hash. This ensures the response time is indistinguishable
-// from a real failed login, preventing phone enumeration via timing.
 func (uc *AuthUsecase) Login(ctx context.Context, phone, password string) (*AuthResult, error) {
 	u, err := uc.userRepo.GetByPhone(ctx, phone)
 	if err != nil {
@@ -188,10 +181,8 @@ func (uc *AuthUsecase) Login(ctx context.Context, phone, password string) (*Auth
 	return &AuthResult{Token: token, User: u}, nil
 }
 
-// ── JWT issuance (private) ────────────────────────────────────────────────────
+//JWT issuance(whole codebase Jwt depends on this)
 
-// issueJWT mints a signed HS256 JWT for the given user.
-// This is the only place in the entire codebase that creates tokens.
 func (uc *AuthUsecase) issueJWT(u *domain.User) (string, error) {
 	now := time.Now().UTC()
 	claims := Claims{

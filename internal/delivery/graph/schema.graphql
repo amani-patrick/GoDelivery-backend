@@ -1,12 +1,12 @@
 """
-Umurinzi GraphQL Schema
+GraphQL Schema
 All mutations that touch sensitive tokens operate over TLS only.
 PII fields (phone, addresses) are never returned in list queries.
 """
 
 scalar Time
 
-# ── Enums ────────────────────────────────────────────────────────────────────
+# Enums 
 
 enum DeliveryState {
   CREATED
@@ -24,7 +24,7 @@ enum Role {
   DISPATCHER
 }
 
-# ── Types ─────────────────────────────────────────────────────────────────────
+# Types 
 
 type Location {
   lat: Float!
@@ -84,7 +84,7 @@ type AuditEvent {
   createdAt: Time!
 }
 
-# ── Inputs ───────────────────────────────────────────────────────────────────
+# Inputs 
 
 input LocationInput {
   lat: Float!
@@ -112,7 +112,7 @@ input LoginInput {
   password: String!
 }
 
-# ── Queries ──────────────────────────────────────────────────────────────────
+# Queries
 
 type Query {
   """Get a single delivery by ID. Requires authentication."""
@@ -128,7 +128,7 @@ type Query {
   auditLog(entityId: ID!): [AuditEvent!]!
 }
 
-# ── Mutations ────────────────────────────────────────────────────────────────
+# Mutations
 
 type Mutation {
   """Register a new user account."""

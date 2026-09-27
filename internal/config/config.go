@@ -1,5 +1,3 @@
-// Package config loads all runtime configuration from environment variables.
-// No config values are ever hard-coded or committed to source control.
 package config
 
 import (
@@ -54,10 +52,10 @@ type MatchingConfig struct {
 	OSRMBaseURL    string
 	WeightTime     float64
 	WeightDistance float64
-	WeightFuel     float64 // task 8
+	WeightFuel     float64 
 	BatchWindowMs  int
 
-	// Re-dispatch timeout in ms — how long to wait for winner to accept (task 1)
+	// Re-dispatch timeout in ms: how long to wait for winner to accept
 	RedispatchTimeoutMs int
 
 	Tier1RadiusMotorcycleKm float64
@@ -70,7 +68,7 @@ type MatchingConfig struct {
 	MaxDeadheadVanKm        float64
 	MaxDeadheadTruckKm      float64
 
-	// Fuel litres per km per vehicle type (task 8)
+	// Fuel litres per km per vehicle type 
 	FuelLitresPerKmMotorcycle float64
 	FuelLitresPerKmCar        float64
 	FuelLitresPerKmVan        float64
@@ -81,48 +79,47 @@ type MatchingConfig struct {
 	HeadingPenaltyMinSpeedKmh  float64
 	HeadingPenaltyMultiplier   float64
 
-	// Stacking parameters (task 4)
+	// Stacking parameters
 	MaxStackDelayMinutes float64
 	MaxStackDirectionDeg float64
 
-	// Premium score reduction (task 7) — subtracted from winner score
+	// Premium score reduction: subtracted from winner score
 	PremiumScoreBoost float64
 
 	OSRMTimeoutMs int
 }
 
-// Load reads all required environment variables and returns a populated Config.
 // Any missing required variable causes an immediate error.
 func Load() (*Config, error) {
 	cfg := &Config{}
 	var missing []string
 
-	// ── Server ────────────────────────────────────────────────────────────────
+	// Server 
 	cfg.Server.Port = envOr("PORT", "8080")
 	cfg.Server.ShutdownTimeout = envDurationOr("SHUTDOWN_TIMEOUT_SECS", 30) * time.Second
 
-	// ── Postgres ──────────────────────────────────────────────────────────────
+	// Postgres 
 	cfg.Postgres.DSN = requireEnv("DATABASE_URL", &missing)
 	cfg.Postgres.MaxConns = int32(envIntOr("DB_MAX_CONNS", 25))
 	cfg.Postgres.MinConns = int32(envIntOr("DB_MIN_CONNS", 5))
 	cfg.Postgres.MaxConnLifetime = envDurationOr("DB_MAX_CONN_LIFETIME_MINS", 30) * time.Minute
 
-	// ── Redis ─────────────────────────────────────────────────────────────────
+	// Redis 
 	cfg.Redis.Addr = envOr("REDIS_ADDR", "localhost:6379")
 	cfg.Redis.Password = os.Getenv("REDIS_PASSWORD") // optional
 	cfg.Redis.DB = envIntOr("REDIS_DB", 0)
 
-	// ── Auth ──────────────────────────────────────────────────────────────────
+	//Auth 
 	cfg.Auth.JWTSecret = requireEnv("JWT_SECRET", &missing)
 	cfg.Auth.JWTExpiryHours = envIntOr("JWT_EXPIRY_HOURS", 24)
 	cfg.Auth.BcryptCost = envIntOr("BCRYPT_COST", 12)
 
-	// ── Anomaly detection ─────────────────────────────────────────────────────
+	// Anomaly detection
 	cfg.Anomaly.StationaryMinutes = envIntOr("ANOMALY_STATIONARY_MINUTES", 5)
 	cfg.Anomaly.RouteDeviationMeters = envFloat64Or("ANOMALY_DEVIATION_METERS", 300)
 	cfg.Anomaly.PanicBufferSize = envIntOr("ANOMALY_PANIC_BUFFER_SIZE", 30)
 
-	// ── Matching engine ───────────────────────────────────────────────────────
+	// Matching engine 
 	cfg.Matching.OSRMBaseURL    = envOr("OSRM_BASE_URL", "http://localhost:5000")
 	cfg.Matching.WeightTime     = envFloat64Or("MATCH_WEIGHT_TIME", 3.0)
 	cfg.Matching.WeightDistance = envFloat64Or("MATCH_WEIGHT_DISTANCE", 1.0)
@@ -140,7 +137,7 @@ func Load() (*Config, error) {
 	cfg.Matching.MaxDeadheadVanKm        = envFloat64Or("MATCH_MAX_DEADHEAD_VAN_KM", 10.0)
 	cfg.Matching.MaxDeadheadTruckKm      = envFloat64Or("MATCH_MAX_DEADHEAD_TRUCK_KM", 15.0)
 
-	// Fuel consumption — Rwanda pump price ~1,550 RWF/litre as of 2026
+	// Fuel consumption
 	cfg.Matching.FuelLitresPerKmMotorcycle = envFloat64Or("FUEL_L_PER_KM_MOTORCYCLE", 0.035)
 	cfg.Matching.FuelLitresPerKmCar        = envFloat64Or("FUEL_L_PER_KM_CAR", 0.080)
 	cfg.Matching.FuelLitresPerKmVan        = envFloat64Or("FUEL_L_PER_KM_VAN", 0.120)
@@ -163,7 +160,7 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+//helpers
 
 func requireEnv(key string, missing *[]string) string {
 	v := os.Getenv(key)
