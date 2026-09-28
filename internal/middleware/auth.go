@@ -1,10 +1,12 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -124,4 +126,24 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Flush delegates to the underlying flusher so streaming/compression still works.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack delegates the raw connection to callers that need protocol switches
+// (WebSocket upgrades). Without this, wrapping the writer in the request
+// logger strips http.Hijacker and every /ws/telemetry upgrade fails with
+// "http.Hijacker is unavailable on the writer".
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("statusRecorder: underlying writer does not implement http.Hijacker")
+	}
+	r.status = http.StatusSwitchingProtocols
+	return h.Hijack()
 }

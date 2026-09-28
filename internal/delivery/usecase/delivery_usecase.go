@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,7 @@ import (
 	"github.com/umurinzi/backend/internal/domain"
 	"github.com/umurinzi/backend/internal/matching"
 	"github.com/umurinzi/backend/internal/pricing"
+	"github.com/umurinzi/backend/internal/tracking"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -56,6 +58,7 @@ type DispatchEnqueuerFunc func(
 	pickupLat, pickupLng float64,
 	weightKg float64,
 	vehicleTypeRequired domain.VehicleType,
+	readyAt time.Time,
 ) error
 
 //DeliveryUsecase orchestrates all delivery lifecycle operations.
@@ -75,6 +78,9 @@ type DeliveryUsecase struct {
 	clearPending     func(ctx context.Context, deliveryID string)
 	getIntended      func(ctx context.Context, deliveryID string) string
 	osrm             *matching.OSRMClient
+	matchEngine      *matching.Engine         // nil when not wired; used for multi-drop TSP
+	dms              *tracking.DeadMansSwitch // nil when not wired
+	spatial          *tracking.SpatialIndex   // nil when not wired; used for pickup geofence
 	log              *slog.Logger
 	cb               *circuit.Breaker
 }
@@ -95,6 +101,9 @@ func NewDeliveryUsecase(
 	clearPending func(ctx context.Context, deliveryID string),
 	getIntended func(ctx context.Context, deliveryID string) string,
 	osrm *matching.OSRMClient,
+	matchEngine *matching.Engine,
+	dms *tracking.DeadMansSwitch,
+	spatial *tracking.SpatialIndex,
 	log *slog.Logger,
 ) *DeliveryUsecase {
 	return &DeliveryUsecase{
@@ -113,6 +122,9 @@ func NewDeliveryUsecase(
 		clearPending:     clearPending,
 		getIntended:      getIntended,
 		osrm:             osrm,
+		matchEngine:      matchEngine,
+		dms:              dms,
+		spatial:          spatial,
 		log:              log,
 		cb:               circuit.New(5, 30*time.Second), // 5 failures -> Open for 30s
 	}
@@ -131,6 +143,7 @@ type CreateDeliveryInput struct {
 	VehicleTypeRequired domain.VehicleType   //empty for any type 
 	PackageCategory     domain.PackageCategory
 	IsPrepaid           bool
+	PrepTimeMinutes     int
 	// IdempotencyKey is optional. When provided and a matching record exists in
 	// Redis, the original Delivery is returned without creating a new one.
 	// The plaintext tokens are NOT re-served on a duplicate — the caller must
@@ -154,6 +167,11 @@ type idempotencyRecord struct {
 	DeliveryID string `json:"delivery_id"`
 }
 
+
+// pickupGeofenceRadiusM is the "driver is at the shop" radius used by the
+// merchant wait bounty. The QR handshake proves presence; this geofence check
+// is the defence-in-depth layer described in the JIT spec.
+const pickupGeofenceRadiusM = 300.0
 
 // Idempotency protocol:
 //   - If in.IdempotencyKey is non-empty, we check Redis for a cached result
@@ -264,6 +282,17 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		category = domain.PackageCategoryGeneral
 	}
 
+	// ── Dynamic Optimization over Static Rules ─────────────────────────────
+	// PrepTimeMinutes from the request is a floor for the category-aware
+	// estimate. PrepTimeForCategory scales with package category AND item
+	// count (e.g. electronics with diagnostics take far longer than documents),
+	// so the JIT scheduler releases drivers on realistic windows per order.
+	prepMinutes := in.PrepTimeMinutes
+	dynamicPrep := matching.PrepTimeForCategory(category, 1)
+	if dynamicPrep > prepMinutes {
+		prepMinutes = dynamicPrep
+	}
+
 	d := &domain.Delivery{
 		ID:                  uuid.NewString(),
 		MerchantID:          in.MerchantID,
@@ -277,6 +306,8 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		WeightKg:            in.WeightKg,
 		VehicleTypeRequired: in.VehicleTypeRequired,
 		PackageCategory:     category,
+		PrepTimeMinutes:     prepMinutes,
+		ReadyAt:             now.Add(time.Duration(prepMinutes) * time.Minute),
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}
@@ -298,7 +329,7 @@ func (uc *DeliveryUsecase) CreateDelivery(
 
 	if uc.dispatchEnqueuer != nil {
 		if err := uc.dispatchEnqueuer(ctx, d.ID, d.PickupLoc.Lat, d.PickupLoc.Lng,
-			d.WeightKg, d.VehicleTypeRequired); err != nil {
+			d.WeightKg, d.VehicleTypeRequired, d.ReadyAt); err != nil {
 			uc.log.Warn("CreateDelivery: dispatch enqueue failed — non-fatal",
 				slog.String("delivery_id", d.ID),
 				slog.String("reason", err.Error()),
@@ -585,6 +616,20 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 		return err
 	}
 
+	// ── "Merchant Lied" Protection Gate ────────────────────────────────
+	// The successful QR handshake IS the proof that the driver is physically
+	// at the shop. If that happened after the promised ReadyAt, the merchant
+	// made the JIT-dispatched driver wait — record a wait bounty so the
+	// micro-fee pipeline can settle it against the merchant's account.
+	uc.recordWaitBountyIfLate(ctx, delivery, driverID, uc.nowUTC())
+
+	// ── Arm the Dead Man's Switch ────────────────────────────────────────
+	// Custody has transferred: the driver is now on an active IN_TRANSIT trip
+	// and GPS silence becomes a safety event.
+	if uc.dms != nil {
+		uc.dms.ArmForTrip(ctx, driverID, deliveryID)
+	}
+
 	uc.appendAudit(ctx, deliveryID, driverID, "PICKUP_CONFIRMED",
 		string(prevState), string(domain.StateInTransit), "custody_transferred_to_driver")
 
@@ -651,8 +696,10 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 		slog.String("delivery_id", deliveryID),
 	)
 
-	//Bayesian rolling rating update(for drivers' rankings and ratings) 
-	uc.updateDriverRating(ctx, driverID, 5.0) 
+	// Trip over — stop monitoring GPS silence for this driver.
+	if uc.dms != nil {
+		uc.dms.DisarmForTrip(ctx, driverID)
+	}
 
 	if err := uc.driverRepo.SetOnTrip(ctx, driverID, false); err != nil {
 		uc.log.Error("ConfirmDelivery: SetOnTrip(false) failed",
@@ -663,6 +710,148 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 	}
 
 	return nil
+}
+
+// nowUTC is a seam for tests.
+func (uc *DeliveryUsecase) nowUTC() time.Time { return time.Now().UTC() }
+
+// haversineMeters is a local geodesic helper (mirrors the tracking package's
+// internal one) so the usecase can verify the pickup geofence without a
+// cross-module dependency on unexported code.
+func haversineMeters(lat1, lng1, lat2, lng2 float64) float64 {
+	const earthRadiusM = 6_371_000.0
+	φ1, φ2 := lat1*math.Pi/180, lat2*math.Pi/180
+	dφ := (lat2 - lat1) * math.Pi / 180
+	dλ := (lng2 - lng1) * math.Pi / 180
+	a := math.Sin(dφ/2)*math.Sin(dφ/2) +
+		math.Cos(φ1)*math.Cos(φ2)*math.Sin(dλ/2)*math.Sin(dλ/2)
+	return earthRadiusM * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+// recordWaitBountyIfLate checks the merchant wait bounty conditions for a
+// pickup that happened after the promised ReadyAt and persists the bounty.
+// Failures are logged but never block the pickup — the delivery must proceed.
+// The driver's last known position (from the telemetry geofence) is used as a
+// defence-in-depth check that the driver really was at the shop coordinates.
+func (uc *DeliveryUsecase) recordWaitBountyIfLate(
+	ctx context.Context,
+	delivery *domain.Delivery,
+	driverID string,
+	pickupConfirmedAt time.Time,
+) {
+	bounty := matching.ComputeMerchantWaitBounty(
+		delivery.ID, driverID, delivery.MerchantID, delivery.ReadyAt, pickupConfirmedAt,
+	)
+	if bounty == nil {
+		return
+	}
+
+	// Geofence defence-in-depth: if we have telemetry for the driver and their
+	// last frame is nowhere near the pickup coordinates, skip the bounty —
+	// the wait may have been caused by traffic, not the merchant.
+	if uc.spatial != nil {
+		frames, err := uc.spatial.GetRecentFrames(ctx, driverID, 1)
+		if err == nil && len(frames) > 0 {
+			distM := haversineMeters(
+				frames[0].Lat, frames[0].Lng,
+				delivery.PickupLoc.Lat, delivery.PickupLoc.Lng,
+			)
+			if distM > pickupGeofenceRadiusM {
+				uc.log.Info("wait bounty skipped — driver not inside pickup geofence",
+					slog.String("delivery_id", delivery.ID),
+					slog.Float64("distance_m", distM),
+				)
+				return
+			}
+		}
+	}
+
+	_, execErr := uc.pool.Exec(ctx, `
+		INSERT INTO merchant_wait_bounties (
+			delivery_id, driver_id, merchant_id,
+			wait_started_at, wait_ended_at, wait_minutes, bounty_rwf, status
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'ACCRUING')
+		ON CONFLICT (delivery_id) DO NOTHING
+	`, bounty.DeliveryID, bounty.DriverID, bounty.MerchantID,
+		bounty.WaitStartedAt, bounty.WaitEndedAt, bounty.WaitMinutes, bounty.BountyRWF,
+	)
+	if execErr != nil {
+		uc.log.Error("wait bounty persist failed — bounty not charged",
+			slog.String("delivery_id", bounty.DeliveryID),
+			slog.String("reason", execErr.Error()),
+		)
+		return
+	}
+
+	uc.log.Info("merchant wait bounty recorded",
+		slog.String("delivery_id", bounty.DeliveryID),
+		slog.String("merchant_id", bounty.MerchantID),
+		slog.Float64("wait_min", bounty.WaitMinutes),
+		slog.Float64("bounty_rwf", bounty.BountyRWF),
+	)
+	uc.appendAudit(ctx, delivery.ID, "SYSTEM", "MERCHANT_WAIT_BOUNTY",
+		"", "",
+		fmt.Sprintf("wait=%.1fmin bounty=%.0fRWF merchant=%s",
+			bounty.WaitMinutes, bounty.BountyRWF, bounty.MerchantID))
+}
+
+// OptimiseMultiDropSequence computes the optimal drop-off order for a driver's
+// active stack using the OSRM distance matrix + TSP solver and persists the
+// enforced sequence. The mobile app must present this order — it never decides
+// the sequence itself.
+func (uc *DeliveryUsecase) OptimiseMultiDropSequence(
+	ctx context.Context, driverID string,
+) (*matching.OptimisedSequence, error) {
+	deliveries, err := uc.repo.ListActiveByDriver(ctx, driverID)
+	if err != nil {
+		return nil, fmt.Errorf("OptimiseMultiDropSequence: list active: %w", err)
+	}
+	if len(deliveries) <= 1 {
+		return nil, fmt.Errorf("%w: driver has %d active deliveries — no sequence to optimise", domain.ErrInvalidInput, len(deliveries))
+	}
+
+	// Driver's current position from the telemetry geofence, falling back to
+	// the first pickup location when no live telemetry exists.
+	driverLat, driverLng := deliveries[0].PickupLoc.Lat, deliveries[0].PickupLoc.Lng
+	if uc.spatial != nil {
+		if frames, fErr := uc.spatial.GetRecentFrames(ctx, driverID, 1); fErr == nil && len(frames) > 0 {
+			driverLat, driverLng = frames[0].Lat, frames[0].Lng
+		}
+	}
+
+	drops := make([]matching.DropPoint, 0, len(deliveries))
+	for _, d := range deliveries {
+		drops = append(drops, matching.DropPoint{
+			DeliveryID: d.ID,
+			Lat:        d.DropoffLoc.Lat,
+			Lng:        d.DropoffLoc.Lng,
+		})
+	}
+
+	seq, err := uc.matchEngine.OptimiseMultiDrop(ctx, driverLat, driverLng, drops)
+	if err != nil {
+		return nil, fmt.Errorf("OptimiseMultiDropSequence: optimise: %w", err)
+	}
+
+	// Enforce the path: persist drop-off 1 → 2 → 3 on each delivery so the
+	// driver app receives a strict sequence, not a suggestion.
+	for i, deliveryID := range seq.Order {
+		if pErr := uc.repo.UpdateOptimisedSequence(ctx, deliveryID, i+1); pErr != nil {
+			uc.log.Error("OptimiseMultiDropSequence: persist sequence failed",
+				slog.String("delivery_id", deliveryID),
+				slog.Int("sequence", i+1),
+				slog.String("reason", pErr.Error()),
+			)
+		}
+	}
+
+	uc.log.Info("multi-drop sequence enforced",
+		slog.String("driver_id", driverID),
+		slog.Int("drops", len(seq.Order)),
+		slog.Float64("total_km", seq.TotalDistanceKm),
+		slog.Float64("total_eta_min", seq.TotalETAMinutes),
+	)
+	return seq, nil
 }
 
 func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(

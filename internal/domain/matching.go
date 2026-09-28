@@ -62,6 +62,7 @@ type BatchOrder struct {
 	VehicleTypeRequired VehicleType `json:"vehicle_type_required"`
 	IsPremium           bool        `json:"is_premium"` 
 	EnqueuedAt          time.Time   `json:"enqueued_at"`
+	ReadyAt             time.Time   `json:"ready_at"`
 }
 
 type HeadingState struct {

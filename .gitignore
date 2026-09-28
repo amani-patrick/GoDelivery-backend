@@ -51,3 +51,10 @@ docker-compose.override.yml
 *.db
 *.sqlite
 *.sqlite3
+
+# OSRM preprocessed artifacts (generated at container start from data/*.osm.pbf)
+data/*.osrm.*
+
+# Python simulator caches
+__pycache__/
+*.pyc

@@ -3,19 +3,18 @@
 -- Adds four columns to the deliveries table:
 --
 --   confirmed_weight_kg  — physical weight confirmed by the driver at pickup
--— weight fraud guard).
+--                          (weight fraud guard).
 --                          0 means not yet confirmed.
 --
 --   priority_level       — 0 = standard, 1 = priority, 2 = premium.
---                          Premium orders bypass stacking and get a score boost
--.
+--                          Premium orders bypass stacking and get a score boost.
 --
 --   stack_group_id       — UUID shared across all deliveries in a stacked route.
 --                          NULL for solo deliveries.
 --
 --   stack_sequence       — position of this delivery within the stacked route.
 --                          0 = solo, 1 = first drop, 2 = second drop, etc.
--— order stacking).
+--                          (order stacking).
 
 BEGIN;
 

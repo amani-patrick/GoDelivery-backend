@@ -1,0 +1,40 @@
+# ── Secrets — never bake these into image layers ─────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── VCS / CI metadata ────────────────────────────────────────────────────────
+.git
+.gitignore
+.dockerignore
+
+# ── Local data: the ~100 MB Rwanda OSM extract must not enter the context ────
+data/
+
+# ── Build output / tooling caches ────────────────────────────────────────────
+bin/
+build/
+dist/
+coverage.out
+*.prof
+vendor/
+
+# ── Docker / compose files not needed inside the image ───────────────────────
+docker-compose.yml
+docker-compose.override.yml
+Makefile
+
+# ── Editor / OS noise ────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+tmp/
+temp/
+*.log
+logs/
+*.db
+*.sqlite
+*.sqlite3

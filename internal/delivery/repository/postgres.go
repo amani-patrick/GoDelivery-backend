@@ -49,6 +49,7 @@ func (r *DeliveryPostgresRepo) Create(ctx context.Context, d *domain.Delivery) e
 			vehicle_type_required, package_category,
 			confirmed_weight_kg, priority_level,
 			stack_group_id, stack_sequence,
+			prep_time_minutes, ready_at,
 			created_at, updated_at
 		) VALUES (
 			$1,  $2,  $3,  $4,  $5,
@@ -59,7 +60,8 @@ func (r *DeliveryPostgresRepo) Create(ctx context.Context, d *domain.Delivery) e
 			$14, $15,
 			$16, $17,
 			$18, $19,
-			$20, $21
+			$20, $21,
+			$22, $23
 		)`
 
 	_, err := r.pool.Exec(ctx, q,
@@ -82,6 +84,8 @@ func (r *DeliveryPostgresRepo) Create(ctx context.Context, d *domain.Delivery) e
 		d.PriorityLevel,
 		nullableString(d.StackGroupID),
 		d.StackSequence,
+		d.PrepTimeMinutes,
+		d.ReadyAt,
 		d.CreatedAt,
 		d.UpdatedAt,
 	)
@@ -109,6 +113,7 @@ func (r *DeliveryPostgresRepo) GetByID(ctx context.Context, id string) (*domain.
 			vehicle_type_required, package_category,
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
+			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
 			created_at, updated_at
 		FROM deliveries
 		WHERE id = $1`
@@ -223,6 +228,7 @@ func (r *DeliveryPostgresRepo) ListByDriver(
 			vehicle_type_required, package_category,
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
+			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
 			created_at, updated_at
 		FROM deliveries
 		WHERE driver_id = $1 AND current_state = ANY($2::text[])
@@ -245,6 +251,7 @@ func (r *DeliveryPostgresRepo) ListByMerchant(
 			vehicle_type_required, package_category,
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
+			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
 			created_at, updated_at
 		FROM deliveries
 		WHERE merchant_id = $1 AND current_state = ANY($2::text[])
@@ -266,6 +273,7 @@ func (r *DeliveryPostgresRepo) ListActiveByDriver(ctx context.Context, driverID 
 			vehicle_type_required, package_category,
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
+			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
 			created_at, updated_at
 		FROM deliveries
 		WHERE driver_id = $1
@@ -318,6 +326,25 @@ func (r *DeliveryPostgresRepo) UpdateStackInfo(ctx context.Context, deliveryID, 
 			slog.String("reason", err.Error()),
 		)
 		return fmt.Errorf("update stack info: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrDeliveryNotFound
+	}
+	return nil
+}
+
+// UpdateOptimisedSequence persists the backend-enforced drop-off position
+// (1-based) computed by the multi-drop TSP optimiser. The mobile app must
+// present this order to the driver — it never decides the sequence itself.
+func (r *DeliveryPostgresRepo) UpdateOptimisedSequence(ctx context.Context, deliveryID string, sequence int) error {
+	const q = `UPDATE deliveries SET optimised_sequence = $2, updated_at = NOW() WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, q, deliveryID, sequence)
+	if err != nil {
+		r.log.Error("delivery.repo.UpdateOptimisedSequence failed",
+			slog.String("delivery_id", deliveryID),
+			slog.String("reason", err.Error()),
+		)
+		return fmt.Errorf("update optimised sequence: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrDeliveryNotFound
@@ -380,6 +407,8 @@ func scanDelivery(row scannable) (*domain.Delivery, error) {
 		&d.PriorityLevel,
 		&d.StackGroupID,
 		&d.StackSequence,
+		&d.PrepTimeMinutes,
+		&d.ReadyAt,
 		&d.CreatedAt,
 		&d.UpdatedAt,
 	)

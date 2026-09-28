@@ -1,10 +1,13 @@
 -- 009: Append-only ledger, weight fraud events, sequence tracking
+--
+-- Type note: users.id and deliveries.id are TEXT (see 001/002) — FK columns
+-- referencing them must be TEXT. Standalone UUID ids keep DEFAULT gen_random_uuid().
 
--- Append-only immutable financial ledger 
+-- Append-only immutable financial ledger
 CREATE TABLE ledger_entries (
-    id              UUID PRIMARY KEY,
-    delivery_id     UUID REFERENCES deliveries(id),
-    actor_id        UUID NOT NULL,
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    delivery_id     TEXT REFERENCES deliveries(id),
+    actor_id        TEXT NOT NULL,
     actor_type      VARCHAR(20) NOT NULL,   -- DRIVER | MERCHANT | PLATFORM
     entry_type      VARCHAR(30) NOT NULL,   -- FARE_EARNED | FINE_DISPLACEMENT | REFUND | ESCROW_HOLD | ESCROW_RELEASE
     amount_rwf      BIGINT NOT NULL,        -- positive = credit, negative = debit
@@ -14,11 +17,11 @@ CREATE TABLE ledger_entries (
 -- immutable: no UPDATE or DELETE allowed in application code
 CREATE INDEX idx_ledger_actor ON ledger_entries (actor_id, created_at);
 
--- Weight discrepancy events 
+-- Weight discrepancy events
 CREATE TABLE weight_discrepancy_events (
-    id              UUID PRIMARY KEY,
-    delivery_id     UUID NOT NULL REFERENCES deliveries(id),
-    driver_id       UUID NOT NULL,
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    delivery_id     TEXT NOT NULL REFERENCES deliveries(id),
+    driver_id       TEXT NOT NULL,
     declared_kg     FLOAT NOT NULL,
     reported_kg     FLOAT,
     photo_url       TEXT,
@@ -27,15 +30,15 @@ CREATE TABLE weight_discrepancy_events (
     resolved_at     TIMESTAMP WITH TIME ZONE
 );
 
--- Per-driver WebSocket sequence number tracker 
+-- Per-driver WebSocket sequence number tracker
 CREATE TABLE driver_sequence (
-    driver_id       UUID PRIMARY KEY REFERENCES users(id),
+    driver_id       TEXT PRIMARY KEY REFERENCES users(id),
     last_seq        BIGINT NOT NULL DEFAULT 0
 );
 
--- Customer risk metrics table 
+-- Customer risk metrics table
 CREATE TABLE customer_risk (
-    customer_id         UUID PRIMARY KEY REFERENCES users(id),
+    customer_id         TEXT PRIMARY KEY REFERENCES users(id),
     total_orders        INT NOT NULL DEFAULT 0,
     completed_orders    INT NOT NULL DEFAULT 0,
     ghost_orders        INT NOT NULL DEFAULT 0,
@@ -44,7 +47,7 @@ CREATE TABLE customer_risk (
     updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
--- Surge price history for moving-average 
+-- Surge price history for moving-average
 CREATE TABLE surge_demand_samples (
     id          BIGSERIAL PRIMARY KEY,
     sampled_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),

@@ -130,6 +130,13 @@ func main() {
 	telemetryHandler := tracking.NewTelemetryHandler(
 		spatialIndex, anomalyDetector, auditLedger, driverRepo, log,
 	)
+
+	// Dead Man's Switch — monitors GPS silence on IN_TRANSIT trips. Constructed
+	// here (before the dispatcher) so the telemetry handler can refresh its
+	// silence timer on every valid frame.
+	dms := tracking.NewDeadMansSwitch(rdb, alertCh, log)
+	telemetryHandler.WithDMS(dms)
+
 	dispatcher := tracking.NewDispatcher(alertCh, auditLedger, telemetryHandler, log)
 
 	// ── 7. Matching engine ────────────────────────────────────────────────────
@@ -208,6 +215,9 @@ func main() {
 		matchEngine.ClearPending,             // clear re-dispatch key on accept 
 		matchEngine.GetIntendedDriver,        // concurrent acceptance guard 
 		osrmClient,                           // osrm client for pin snapping
+		matchEngine,                          // multi-drop TSP optimiser
+		dms,                                  // Dead Man's Switch arm/disarm
+		spatialIndex,                         // pickup geofence for wait bounty
 		log,
 	)
 
@@ -219,13 +229,17 @@ func main() {
 	r.Use(chimw.RequestID)
 	r.Use(middleware.Recovery(log))
 	r.Use(middleware.RequestLogger(log))
-	r.Use(chimw.Compress(5))
+	// NOTE: chimw.Compress must NOT wrap the /ws/telemetry route — its wrapped
+	// ResponseWriter does not implement http.Hijacker, which the WebSocket
+	// upgrade requires ("http.Hijacker is unavailable on the writer" → 500).
+	// It is applied to the GraphQL group only; WS frames are tiny anyway.
 
 	r.Post("/auth/register", injectOperation(deliveryHandler, "Register"))
 	r.Post("/auth/login",    injectOperation(deliveryHandler, "Login"))
 	r.Get("/health",         healthHandler(pool, rdb, log))
 
 	r.Group(func(r chi.Router) {
+		r.Use(chimw.Compress(5))
 		r.Use(middleware.JWTMiddleware(cfg.Auth.JWTSecret))
 		r.Post("/graphql", deliveryHandler.ServeHTTP)
 	})
@@ -275,6 +289,13 @@ func main() {
 	}, func(ctx context.Context) int {
 		return spatialIndex.OnlineCount()
 	})
+
+	// Dead Man's Switch scanner — emits DEAD_MANS_SWITCH alerts on GPS silence.
+	go dms.RunScanner(bgCtx)
+
+	// RRA Micro-Invoicing worker — builds tax invoices for completed deliveries.
+	invoiceWorker := ledger.NewInvoiceWorker(pool, log)
+	go invoiceWorker.Run(bgCtx)
 
 	// ── 11. HTTP server ───────────────────────────────────────────────────────
 	srv := &http.Server{

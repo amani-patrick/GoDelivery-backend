@@ -3,7 +3,9 @@
 # Services:
 #   postgres  — PostgreSQL 16 + PostGIS 3.4 (primary datastore)
 #   redis     — Redis 7 (spatial index, distributed locks, frame buffers)
+#   migrate   — one-shot migration runner (all .up.sql files, then exits)
 #   backend   — Go server (built from source via Dockerfile)
+#   osrm      — OSRM router over the Rwanda extract in ./data
 #
 # Usage:
 #   cp .env.example .env          # fill in JWT_SECRET
@@ -34,21 +36,30 @@ services:
       start_period: 10s
 
   # ── Redis ───────────────────────────────────────────────────────────────────
+  # The password flag is injected via entrypoint substitution so an EMPTY
+  # password simply omits --requirepass. A plain `--requirepass ${VAR:-}`
+  # collapses the two list items into one and corrupts the next flag
+  # (--maxmemory would become the password value).
   redis:
     image: redis:7-alpine
     container_name: umurinzi_redis
     restart: unless-stopped
-    command: >
-      redis-server
-      --requirepass ${REDIS_PASSWORD:-}
-      --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
-      --save ""
-      --appendonly no
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server --requirepass "$$REDIS_PASSWORD" --maxmemory 256mb \
+            --maxmemory-policy allkeys-lru --save "" --appendonly no
+        fi
+        exec redis-server --maxmemory 256mb \
+          --maxmemory-policy allkeys-lru --save "" --appendonly no
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG || redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -97,23 +108,66 @@ services:
       REDIS_PASSWORD:     ${REDIS_PASSWORD:-}
       REDIS_DB:           ${REDIS_DB:-0}
 
-      JWT_SECRET:         ${JWT_SECRET}
+      JWT_SECRET:         ${JWT_SECRET:?JWT_SECRET is required — copy .env.example to .env and set it}
       JWT_EXPIRY_HOURS:   ${JWT_EXPIRY_HOURS:-24}
       BCRYPT_COST:        ${BCRYPT_COST:-12}
 
       ANOMALY_STATIONARY_MINUTES:  ${ANOMALY_STATIONARY_MINUTES:-5}
       ANOMALY_DEVIATION_METERS:    ${ANOMALY_DEVIATION_METERS:-300}
       ANOMALY_PANIC_BUFFER_SIZE:   ${ANOMALY_PANIC_BUFFER_SIZE:-30}
+
+      # OSRM runs as a sibling service — must override the localhost default
+      # or the matching engine silently degrades to haversine estimates.
+      OSRM_BASE_URL:      ${OSRM_BASE_URL:-http://osrm:5000}
+      OSRM_TIMEOUT_MS:    ${OSRM_TIMEOUT_MS:-3000}
+
+      # Matching engine tuning (defaults mirror config.go).
+      MATCH_WEIGHT_TIME:     ${MATCH_WEIGHT_TIME:-3.0}
+      MATCH_WEIGHT_DISTANCE: ${MATCH_WEIGHT_DISTANCE:-1.0}
+      MATCH_WEIGHT_FUEL:     ${MATCH_WEIGHT_FUEL:-0.5}
+      MATCH_BATCH_WINDOW_MS: ${MATCH_BATCH_WINDOW_MS:-12000}
+      MATCH_REDISPATCH_TIMEOUT_MS: ${MATCH_REDISPATCH_TIMEOUT_MS:-45000}
+
+      MATCH_RADIUS_MOTORCYCLE_KM: ${MATCH_RADIUS_MOTORCYCLE_KM:-3.0}
+      MATCH_RADIUS_CAR_KM:        ${MATCH_RADIUS_CAR_KM:-5.0}
+      MATCH_RADIUS_VAN_KM:        ${MATCH_RADIUS_VAN_KM:-7.0}
+      MATCH_RADIUS_TRUCK_KM:      ${MATCH_RADIUS_TRUCK_KM:-10.0}
+
+      MATCH_MAX_DEADHEAD_MOTORCYCLE_KM: ${MATCH_MAX_DEADHEAD_MOTORCYCLE_KM:-3.0}
+      MATCH_MAX_DEADHEAD_CAR_KM:        ${MATCH_MAX_DEADHEAD_CAR_KM:-6.0}
+      MATCH_MAX_DEADHEAD_VAN_KM:        ${MATCH_MAX_DEADHEAD_VAN_KM:-10.0}
+      MATCH_MAX_DEADHEAD_TRUCK_KM:      ${MATCH_MAX_DEADHEAD_TRUCK_KM:-15.0}
+
+      FUEL_L_PER_KM_MOTORCYCLE: ${FUEL_L_PER_KM_MOTORCYCLE:-0.035}
+      FUEL_L_PER_KM_CAR:        ${FUEL_L_PER_KM_CAR:-0.080}
+      FUEL_L_PER_KM_VAN:        ${FUEL_L_PER_KM_VAN:-0.120}
+      FUEL_L_PER_KM_TRUCK:      ${FUEL_L_PER_KM_TRUCK:-0.250}
+      FUEL_PRICE_RWF_PER_LITRE: ${FUEL_PRICE_RWF_PER_LITRE:-1550.0}
+
+      MATCH_HEADING_PENALTY_THRESHOLD_DEG: ${MATCH_HEADING_PENALTY_THRESHOLD_DEG:-90.0}
+      MATCH_HEADING_PENALTY_MIN_SPEED_KMH: ${MATCH_HEADING_PENALTY_MIN_SPEED_KMH:-30.0}
+      MATCH_HEADING_PENALTY_MULTIPLIER:    ${MATCH_HEADING_PENALTY_MULTIPLIER:-1.8}
+
+      MATCH_MAX_STACK_DELAY_MINUTES: ${MATCH_MAX_STACK_DELAY_MINUTES:-5.0}
+      MATCH_MAX_STACK_DIRECTION_DEG: ${MATCH_MAX_STACK_DIRECTION_DEG:-45.0}
+      MATCH_PREMIUM_SCORE_BOOST:     ${MATCH_PREMIUM_SCORE_BOOST:-10.0}
     ports:
-      - "${PORT:-8080}:${PORT:-8080}"
+      - target: 8080
+        published: ${PORT:-8080}
+        protocol: tcp
+        mode: host
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT:-8080}/health || exit 1"]
+      test: ["CMD", "/healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
 
   # ── OSRM ────────────────────────────────────────────────────────────────────
+  # Pre-processes the Rwanda OSM extract on first run (extract → partition →
+  # customize), then serves the routing API. First start can take several
+  # minutes — the backend's OSRM client fails soft (haversine fallback) while
+  # osrm-extract is still running.
   osrm:
     image: ghcr.io/project-osrm/osrm-backend:latest
     container_name: osrm-backend
@@ -133,4 +187,3 @@ services:
 volumes:
   postgres_data:
     driver: local
-

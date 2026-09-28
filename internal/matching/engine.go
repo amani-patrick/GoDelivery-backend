@@ -546,16 +546,15 @@ func (e *Engine) EvaluateStack(ctx context.Context, req domain.StackRequest) (do
 	}, nil
 }
 
-// ── Batch loop ────────────────────────────────────────────────────────────────
-
-// RunBatch drains the Redis batch queue, runs Match for each order, and
-// handles intra-batch driver collisions using a greedy cascade.
 func (e *Engine) RunBatch(ctx context.Context) []domain.MatchResult {
-	raw, err := e.rdb.LRange(ctx, batchQueueKey, 0, -1).Result()
+	// Drain ONLY the JIT handoff queue. match:queue is the raw intake that the
+	// JIT scheduler classifies each tick; orders that enter it after the JIT
+	// pass simply wait for the next tick instead of bypassing the gate.
+	raw, err := e.rdb.LRange(ctx, matchReadyKey, 0, -1).Result()
 	if err != nil || len(raw) == 0 {
 		return nil
 	}
-	_ = e.rdb.Del(ctx, batchQueueKey)
+	_ = e.rdb.Del(ctx, matchReadyKey)
 
 	orders := make([]domain.BatchOrder, 0, len(raw))
 	for _, r := range raw {
@@ -567,7 +566,6 @@ func (e *Engine) RunBatch(ctx context.Context) []domain.MatchResult {
 		orders = append(orders, o)
 	}
 
-	// Sort: premium orders first so they get first pick of the best driver.
 	sort.Slice(orders, func(i, j int) bool {
 		return orders[i].IsPremium && !orders[j].IsPremium
 	})
@@ -624,6 +622,8 @@ func (e *Engine) RunBatch(ctx context.Context) []domain.MatchResult {
 }
 
 // RunBatchLoop starts the periodic batch processing goroutine.
+// Order flow: CreateDelivery → Enqueue(match:queue) →
+// ProcessJITPendingPool (trigger-zone gate) → match:ready → RunBatch → Match.
 func (e *Engine) RunBatchLoop(ctx context.Context, resultCh chan<- []domain.MatchResult) {
 	interval := time.Duration(e.cfg.BatchWindowMs) * time.Millisecond
 	ticker := time.NewTicker(interval)
@@ -636,6 +636,12 @@ func (e *Engine) RunBatchLoop(ctx context.Context, resultCh chan<- []domain.Matc
 			e.log.Info("matching engine batch loop stopped")
 			return
 		case <-ticker.C:
+			// JIT Pre-Dispatch: classify the queue first — only orders inside the
+			// trigger zone are pushed back for matching. Must run BEFORE RunBatch,
+			// otherwise deferred orders would be matched immediately and the JIT
+			// gate would be a no-op.
+			e.ProcessJITPendingPool(ctx)
+
 			if results := e.RunBatch(ctx); len(results) > 0 {
 				select {
 				case resultCh <- results:
@@ -646,8 +652,6 @@ func (e *Engine) RunBatchLoop(ctx context.Context, resultCh chan<- []domain.Matc
 		}
 	}
 }
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
 func (e *Engine) tier1RadiusFor(vt domain.VehicleType) float64 {
 	if r, ok := e.cfg.Tier1RadiusKm[vt]; ok && r > 0 {

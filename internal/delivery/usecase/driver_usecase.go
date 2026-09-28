@@ -313,6 +313,7 @@ func (uc *DriverUsecase) EnqueueForDispatch(
 	pickupLat, pickupLng float64,
 	weightKg float64,
 	vehicleTypeRequired domain.VehicleType,
+	readyAt time.Time,
 ) error {
 	if uc.engine == nil {
 		return nil 
@@ -323,6 +324,8 @@ func (uc *DriverUsecase) EnqueueForDispatch(
 		PickupLng:           pickupLng,
 		WeightKg:            weightKg,
 		VehicleTypeRequired: vehicleTypeRequired,
+		EnqueuedAt:          time.Now().UTC(),
+		ReadyAt:             readyAt,
 	})
 }
 

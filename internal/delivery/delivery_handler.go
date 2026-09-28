@@ -155,6 +155,8 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 		return h.resolveGetDriverProfile(ctx, vars)
 	case "FindEligibleDrivers":
 		return h.resolveFindEligibleDrivers(ctx, vars)
+	case "OptimiseMultiDropSequence":
+		return h.resolveOptimiseMultiDropSequence(ctx, vars)
 
 	//Business / merchant profile 
 	case "UpsertBusinessProfile":
@@ -233,6 +235,8 @@ func (h *Handler) resolveCreateDelivery(ctx context.Context, vars map[string]any
 		WeightKg:            float64From(input, "weightKg"),
 		VehicleTypeRequired: domain.VehicleType(stringOrEmpty(input, "vehicleTypeRequired")),
 		PackageCategory:     domain.PackageCategory(stringOrEmpty(input, "packageCategory")),
+		IsPrepaid:           boolFrom(input, "isPrepaid"),
+		PrepTimeMinutes:     intFrom(input, "prepTimeMinutes"),
 		IdempotencyKey:      idempotencyKey,
 	})
 	if err != nil {
@@ -382,6 +386,29 @@ func (h *Handler) resolveMerchantDeliveries(ctx context.Context, vars map[string
 		return nil, err
 	}
 	return marshalDeliveries(deliveries), nil
+}
+
+// resolveOptimiseMultiDropSequence lets a driver request the backend-enforced
+// drop-off order for their current stack. The TSP result is persisted on each
+// delivery, so the app presents drop-off 1 → 2 → 3 — never its own choice.
+func (h *Handler) resolveOptimiseMultiDropSequence(ctx context.Context, vars map[string]any) (any, error) {
+	driverID, err := h.requireAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seq, err := h.deliveryUC.OptimiseMultiDropSequence(ctx, driverID)
+	if err != nil {
+		h.log.Warn("OptimiseMultiDropSequence failed",
+			slog.String("driver_id", driverID),
+			slog.String("reason", err.Error()),
+		)
+		return nil, err
+	}
+	return map[string]any{
+		"order":            seq.Order,
+		"totalDistanceKm":  seq.TotalDistanceKm,
+		"totalEtaMinutes": seq.TotalETAMinutes,
+	}, nil
 }
 
 //Driver resolvers
@@ -777,6 +804,19 @@ func float64From(m map[string]any, key string) float64 {
 		}
 	}
 	return 0
+}
+
+func boolFrom(m map[string]any, key string) bool {
+	if v, ok := m[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+func intFrom(m map[string]any, key string) int {
+	return int(float64From(m, key))
 }
 
 func locationFromMap(m map[string]any, key string) [2]float64 {

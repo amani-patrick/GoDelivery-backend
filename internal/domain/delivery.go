@@ -122,9 +122,11 @@ type Delivery struct {
 	// 0 = standard, 1 = priority, 2 = premium.
 	PriorityLevel int `json:"priority_level"`
 
-	// Stacking sequence: 0 = solo delivery, ≥1 = position in a stacked route.
 	StackSequence int    `json:"stack_sequence,omitempty"`
-	StackGroupID  string `json:"stack_group_id,omitempty"` // shared across stacked deliveries
+	StackGroupID  string `json:"stack_group_id,omitempty"`
+
+	PrepTimeMinutes int       `json:"prep_time_minutes"`
+	ReadyAt         time.Time `json:"ready_at"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -158,7 +160,11 @@ func (d *Delivery) Transition(next DeliveryState, inputToken string) error {
 	}
 
 	d.CurrentState = next
-	d.UpdatedAt = time.Now().UTC()
+	// NOTE: Transition deliberately does NOT touch d.UpdatedAt. The repository's
+	// optimistic lock (UPDATE ... WHERE updated_at = <value read by GetByID>)
+	// compares against the timestamp fetched from the database. Mutating it here
+	// would make every post-transition Update match zero rows and fail with
+	// ErrDeliveryNotFound. Update() stamps the new timestamp on write.
 	return nil
 }
 
@@ -188,6 +194,10 @@ type DeliveryRepository interface {
 	// UpdateStackInfo writes the stack_group_id and stack_sequence for a stacked
 	// delivery after the matching engine approves a multi-drop route 
 	UpdateStackInfo(ctx context.Context, deliveryID, stackGroupID string, sequence int) error
+
+	// UpdateOptimisedSequence persists the backend-enforced drop-off order
+	// (1-based) computed by the multi-drop TSP optimiser.
+	UpdateOptimisedSequence(ctx context.Context, deliveryID string, sequence int) error
 
 	// ListActiveByDriver returns all non-terminal deliveries for a driver.
 	// Used by the stacking engine to find a driver's current active orders.

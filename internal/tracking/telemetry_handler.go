@@ -68,6 +68,13 @@ type DriverPresenceNotifier interface {
 	SetOnlineStatus(ctx context.Context, userID string, online bool) error
 }
 
+// DMSRefresher is the minimal Dead Man's Switch surface the telemetry
+// pipeline needs. Satisfied by *DeadMansSwitch; kept as an interface so the
+// handler has no struct dependency on the monitor itself.
+type DMSRefresher interface {
+	RefreshPing(ctx context.Context, driverID string)
+}
+
 // heartbeatTTLKey is the Redis key prefix for per-driver heartbeat keys.
 // Full key: "driver:heartbeat:<driverID>"
 // TTL is refreshed on every valid FRAME message. When it expires the
@@ -85,6 +92,7 @@ type TelemetryHandler struct {
 	detector     *AnomalyDetector
 	ledger       domain.LedgerRepository
 	presence     DriverPresenceNotifier // nil when not wired 
+	dms          DMSRefresher           // nil when not wired — Dead Man's Switch ping refresh
 	log          *slog.Logger
 	seqGuard     *SequenceGuard
 	spoofDetect  *SpoofDetector
@@ -112,6 +120,15 @@ func NewTelemetryHandler(
 		spoofDetect: NewSpoofDetector(log),
 		activeConns: make(map[string]*websocket.Conn),
 	}
+}
+
+// WithDMS attaches the Dead Man's Switch refresher to the handler.
+// The DMS is constructed after the handler in main's wiring order (it needs
+// alertCh, which the handler also gets indirectly), so it's injected via
+// setter rather than growing the constructor signature again.
+func (h *TelemetryHandler) WithDMS(dms DMSRefresher) *TelemetryHandler {
+	h.dms = dms
+	return h
 }
 
 // ServeHTTP upgrades the HTTP connection to WebSocket and starts the per-driver
@@ -307,6 +324,13 @@ func (h *TelemetryHandler) handleFrame(
 	// The heartbeat scanner in SpatialIndex.RunHeartbeatScanner forces drivers
 	// offline in Postgres when this key expires after 90 seconds of silence.
 	h.spatial.RefreshHeartbeat(ctx, driverID)
+
+	// Dead Man's Switch: every valid telemetry frame resets the silence timer
+	// for a driver on an active IN_TRANSIT trip. 7 minutes of zero pings then
+	// triggers the high-priority DEAD_MANS_SWITCH alert via the scanner.
+	if h.dms != nil {
+		h.dms.RefreshPing(ctx, driverID)
+	}
 
 	// Anomaly detection runs in a separate goroutine — the telemetry pipeline
 	// must never block waiting for detection logic.
