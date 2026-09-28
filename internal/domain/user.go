@@ -22,12 +22,13 @@ const (
 	RoleDriver     Role = "DRIVER"
 	RoleCustomer   Role = "CUSTOMER"
 	RoleDispatcher Role = "DISPATCHER"
+	RoleAdmin      Role = "ADMIN"
 )
 
 // IsValid reports whether r is one of the defined constants.
 func (r Role) IsValid() bool {
 	switch r {
-	case RoleMerchant, RoleDriver, RoleCustomer, RoleDispatcher:
+	case RoleMerchant, RoleDriver, RoleCustomer, RoleDispatcher, RoleAdmin:
 		return true
 	}
 	return false

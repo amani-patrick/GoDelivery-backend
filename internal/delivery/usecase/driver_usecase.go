@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/umurinzi/backend/internal/domain"
 	"github.com/umurinzi/backend/internal/matching"
+	"github.com/umurinzi/backend/internal/middleware"
 )
 
 
@@ -109,7 +110,35 @@ func (uc *DriverUsecase) RegisterDriver(ctx context.Context, in RegisterDriverIn
 	return p, nil
 }
 
+// requireAdmin enforces the ADMIN gate on privileged operations. The role
+// comes from the JWT claims (request context) and is re-verified against the
+// users table so a token minted before a demotion is honoured immediately.
+func (uc *DriverUsecase) requireAdmin(ctx context.Context, callerID, op string) error {
+	role, _ := ctx.Value(middleware.CtxUserRole).(string)
+	if role != string(domain.RoleAdmin) {
+		uc.log.Warn("privileged operation denied — caller role is not ADMIN",
+			slog.String("op", op),
+			slog.String("caller_id", callerID),
+			slog.String("token_role", role),
+		)
+		return domain.ErrUnauthorized
+	}
+	u, err := uc.userRepo.GetByID(ctx, callerID)
+	if err != nil || u == nil || u.Role != domain.RoleAdmin {
+		uc.log.Warn("privileged operation denied — DB role check failed",
+			slog.String("op", op),
+			slog.String("caller_id", callerID),
+			slog.String("reason", err.Error()),
+		)
+		return domain.ErrUnauthorized
+	}
+	return nil
+}
+
 func (uc *DriverUsecase) ApproveDriver(ctx context.Context, driverUserID, approvedByUserID string) error {
+	if err := uc.requireAdmin(ctx, approvedByUserID, "ApproveDriver"); err != nil {
+		return err
+	}
 	profile, err := uc.driverRepo.GetByUserID(ctx, driverUserID)
 	if err != nil {
 		return err
@@ -139,6 +168,9 @@ func (uc *DriverUsecase) ApproveDriver(ctx context.Context, driverUserID, approv
 }
 
 func (uc *DriverUsecase) SuspendDriver(ctx context.Context, driverUserID, suspendedByUserID, reason string) error {
+	if err := uc.requireAdmin(ctx, suspendedByUserID, "SuspendDriver"); err != nil {
+		return err
+	}
 	if reason == "" {
 		return fmt.Errorf("%w: suspension reason is required", domain.ErrInvalidInput)
 	}

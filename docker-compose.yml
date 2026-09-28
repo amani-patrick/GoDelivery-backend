@@ -20,6 +20,9 @@ services:
     image: postgis/postgis:16-3.4-alpine
     container_name: umurinzi_postgres
     restart: unless-stopped
+    # Stress-tested with a 100-connection app pool + background workers;
+    # the default 100-connection server limit would exhaust under load.
+    command: ["postgres", "-c", "max_connections=300", "-c", "shared_buffers=256MB"]
     environment:
       POSTGRES_DB:       umurinzi
       POSTGRES_USER:     umurinzi
@@ -88,6 +91,12 @@ services:
       dockerfile: Dockerfile
     container_name: umurinzi_backend
     restart: unless-stopped
+    # Load testing hit socket collapse at ~1200 concurrent WebSocket drivers on
+    # the Docker default soft fd limit (1024). Give the runtime real headroom.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       postgres:
         condition: service_healthy

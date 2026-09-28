@@ -28,7 +28,9 @@ Monitoring while it runs:
 """
 
 import argparse
+import importlib.util
 import json
+import os
 import random
 import sys
 import threading
@@ -37,6 +39,14 @@ import uuid
 
 import requests
 import websocket  # pip install websocket-client
+
+# Admin JWT minter (scripts/admin_token.py) — RBAC blocks privileged
+# self-registration, so the harness mints its own ADMIN token.
+_at_spec = importlib.util.spec_from_file_location(
+    "admin_token", os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "admin_token.py"))
+_at = importlib.util.module_from_spec(_at_spec)
+_at_spec.loader.exec_module(_at)
+mint_admin_token = _at.mint_admin_token
 
 
 # ── Kigali test coordinates ────────────────────────────────────────────────────
@@ -461,6 +471,21 @@ def bootstrap(cl, n_drivers):
     register_or_login(cl, "Sim Merchant", phone, "SimPassw0rd!", "MERCHANT")
     log(f"merchant ready: {cl.user_id}")
 
+    # Fund the merchant wallet — orders are escrow-funded since the wallet
+    # layer went live (unfunded orders are rejected by design).
+    topup = 1_000_000
+    tb = cl._ok(cl.op("TopUpWallet", {"amountRwf": topup}), "merchant topup")
+    if cl.gql_errors(tb):
+        log(f"  merchant topup failed: {cl.gql_errors(tb)[0]['message'][:60]}…")
+    else:
+        log(f"  merchant funded: {tb['data']['balanceRwf']} RWF")
+
+    # RBAC: ApproveDriver/SuspendDriver require ADMIN. Mint an admin JWT for
+    # the harness (privilege escalation via self-registration is blocked).
+    admin = Client(BASE_URL)
+    admin.token = mint_admin_token()
+    admin.user_id = "platform-treasury"
+
     drivers = []
     for i in range(n_drivers):
         d = Client(BASE_URL)
@@ -474,7 +499,9 @@ def bootstrap(cl, n_drivers):
         }}), "register driver")
         if cl.gql_errors(body):
             log(f"  driver{i}: RegisterDriver skipped ({cl.gql_errors(body)[0]['message'][:60]}…)")
-        body = cl._ok(d.op("ApproveDriver", {"driverUserId": d.user_id}), "approve driver")
+        # Approvals are ADMIN-only now (RBAC). The admin client is minted once
+        # per bootstrap call (below) via scripts/admin_token.py.
+        body = cl._ok(admin.op("ApproveDriver", {"driverUserId": d.user_id}), "approve driver")
         if cl.gql_errors(body):
             log(f"  driver{i}: ApproveDriver skipped ({cl.gql_errors(body)[0]['message'][:60]}…)")
         d.set_driver_online()
@@ -484,7 +511,130 @@ def bootstrap(cl, n_drivers):
         drivers.append({"label": f"driver{i}", "client": d, "token": d.token,
                         "lat": lat, "lng": lng})
     log(f"{len(drivers)} drivers registered, approved, online")
-    return drivers
+    return drivers, admin
+
+
+# ── money phase: escrow → earnings → instant cashout ──────────────────────────
+
+def phase_money(n_drivers=2):
+    """End-to-end money pipeline verification:
+
+    1. Merchant without funds cannot place an order (escrow gate).
+    2. Top up → create order → fare escrowed (balance drops, escrow rises).
+    3. Full lifecycle to DELIVERED → driver wallet credited instantly.
+    4. Driver sees MyEarnings for today (trips + net RWF).
+    5. Driver cashes out everything instantly (stub provider) → PAID.
+    6. RBAC: non-admin cannot approve drivers; admin (minted JWT) can.
+    """
+    ok = True
+    admin = Client(BASE_URL)
+    admin.token = mint_admin_token()
+    admin.user_id = "platform-treasury"
+
+    run_tag = uuid.uuid4().hex[:6].upper()
+
+    # Fresh merchant + driver (unique phones, re-run safe)
+    m = Client(BASE_URL)
+    m.register("Money Merchant", f"+25074{int(time.time()*10) % 100000000:08d}", "SimPassw0rd!", "MERCHANT")
+    d = Client(BASE_URL)
+    d.register("Money Driver", f"+25075{int(time.time()*10) % 100000000:08d}", "SimPassw0rd!", "DRIVER")
+    cust_id = m.create_customer()
+
+    # driver profile + admin approval
+    d.op("RegisterDriver", {"input": {
+        "nationalId": f"1199{run_tag}001", "licenseNumber": f"LIC-M{run_tag}",
+        "vehicleType": "MOTORCYCLE", "plateNumber": f"MNY{run_tag}", "maxWeightKg": 30}})
+
+    # ── RBAC check: merchant must NOT be able to approve a driver ──
+    rb = m.op("ApproveDriver", {"driverUserId": d.user_id})
+    rb_errors = m.gql_errors(m._ok(rb, "rbac probe"))
+    if rb_errors:
+        log(f"✓ RBAC: merchant ApproveDriver denied ({rb_errors[0]['message'][:60]}…)")
+    else:
+        log("✗ RBAC FAILURE: merchant successfully approved a driver!")
+        ok = False
+        return ok  # can't continue with an accidentally-active driver
+
+    body = m.gql_data(m._ok(admin.op("ApproveDriver", {"driverUserId": d.user_id}), "admin approve"))
+    if not body:
+        log("✗ admin ApproveDriver failed")
+        return False
+    log(f"✓ RBAC: admin approved driver {d.user_id[:8]}…")
+    d.set_driver_online()
+
+    # ── 1. unfunded merchant must be rejected ──
+    body = m.gql_errors(m._ok(m.create_delivery(
+        KIGALI_HEIGHTS, KIMIRONKO, customer_id=cust_id), "unfunded create"))
+    if body and "INSUFFICIENT" in body[0].get("extensions", {}).get("code", ""):
+        log("✓ escrow gate: unfunded merchant order rejected")
+    else:
+        log("✗ escrow gate: unfunded order was NOT rejected")
+        ok = False
+
+    # ── 2. top up and place a funded order ──
+    topup = 50_000
+    w = m.gql_data(m._ok(m.op("TopUpWallet", {"amountRwf": topup}), "topup"))
+    log(f"✓ merchant wallet topped up: balance={w['balanceRwf']} RWF")
+
+    resp = m.gql_data(m._ok(m.create_delivery(
+        KIGALI_HEIGHTS, KIMIRONKO, customer_id=cust_id), "funded create"), None)
+    delivery = (resp or {}).get("delivery")
+    if not delivery:
+        log("✗ funded order creation failed")
+        return False
+    fare = delivery.get("fareRwf", 0)
+    w2 = m.gql_data(m._ok(m.op("MyWallet", {}), "merchant wallet"))
+    log(f"✓ order created: fare={fare} RWF, merchant balance={w2['balanceRwf']}, escrow={w2['escrowRwf']}")
+    if w2["balanceRwf"] >= topup or w2["escrowRwf"] < fare:
+        log("✗ escrow accounting wrong")
+        ok = False
+
+    # ── 3. drive the lifecycle to DELIVERED ──
+    qr = resp.get("plaintextQrCode")
+    pin = resp.get("plaintextPin")
+    acc_body = m._ok(d.op("AcceptOrder", {"deliveryId": delivery["id"]}), "accept")
+    if m.gql_errors(acc_body):
+        log(f"✗ AcceptOrder failed: {m.gql_errors(acc_body)[0]['message'][:80]}")
+        return False
+    log("✓ driver accepted (no bcrypt on this path — should be fast)")
+    pu_body = m._ok(d.op("ConfirmPickup", {"deliveryId": delivery["id"],
+                                           "scannedToken": qr, "confirmedWeightKg": 1.0}), "pickup")
+    if m.gql_errors(pu_body):
+        log(f"✗ ConfirmPickup failed: {m.gql_errors(pu_body)[0]['message'][:80]}")
+        return False
+    log("✓ pickup confirmed")
+    cd_body = m._ok(d.op("ConfirmDelivery", {"deliveryId": delivery["id"], "customerPin": pin}),
+                    "confirm delivery")
+    if m.gql_errors(cd_body):
+        log(f"✗ ConfirmDelivery failed: {m.gql_errors(cd_body)[0]['message'][:80]}")
+        return False
+    log("✓ delivery confirmed")
+
+    # ── 4. driver earnings + instant cashout ──
+    earn = m.gql_data(m._ok(d.op("MyEarnings", {"period": "today"}), "earnings"))
+    log(f"✓ driver earnings today: trips={earn['tripsCompleted']} net={earn['netRwf']} RWF")
+    if earn["tripsCompleted"] < 1 or earn["netRwf"] <= 0:
+        log("✗ driver was not credited for the delivery")
+        ok = False
+
+    wal = m.gql_data(m._ok(d.op("MyWallet", {}), "driver wallet"))
+    cash_all = wal["balanceRwf"]
+    co = m.gql_data(m._ok(d.op("RequestCashout", {
+        "input": {"amountRwf": cash_all, "phone": "+250788999777"}}), "cashout"))
+    log(f"✓ instant cashout: {co['amountRwf']} RWF → {co['phone']} status={co['status']} ref={co.get('providerRef','')}")
+    if co["status"] != "PAID":
+        log("✗ cashout did not complete instantly")
+        ok = False
+    wal_after = m.gql_data(m._ok(d.op("MyWallet", {}), "driver wallet after"))
+    if wal_after["balanceRwf"] != 0:
+        log(f"✗ wallet should be empty after full cashout, has {wal_after['balanceRwf']}")
+        ok = False
+
+    # Platform commission check (admin wallet should have grown)
+    stats = m.gql_data(m._ok(admin.op("PlatformStats", {}), "platform stats"))
+    log(f"✓ platform stats (admin-only): commission={stats['commissionRwf']} RWF")
+
+    return ok
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -496,7 +646,7 @@ def main():
     ap = argparse.ArgumentParser(description="Umurinzi concurrency simulator")
     ap.add_argument("--base", default="http://localhost:8080")
     ap.add_argument("--phase", default="all",
-                    choices=["gates", "race", "load", "chaos", "all"])
+                    choices=["gates", "race", "load", "chaos", "money", "all"])
     ap.add_argument("--drivers", type=int, default=5)
     ap.add_argument("--orders", type=int, default=8)
     ap.add_argument("--duration", type=int, default=90)
@@ -507,12 +657,12 @@ def main():
     if args.phase in ("all", "gates", "race", "load", "chaos"):
         cl = Client(BASE_URL)
         try:
-            drivers = bootstrap(cl, args.drivers)
+            drivers, admin = bootstrap(cl, args.drivers)
         except RuntimeError as e:
             log(f"bootstrap failed: {e} — trying login fallback (stack already seeded?)")
             cl = Client(BASE_URL)
             cl.login("+250780000001", "SimPassw0rd!")
-            drivers = bootstrap(cl, args.drivers)
+            drivers, admin = bootstrap(cl, args.drivers)
 
         if args.phase in ("all", "gates"):
             results.append(("gates", phase_gates(cl)))
@@ -523,6 +673,9 @@ def main():
         if args.phase == "chaos":
             results.append(("chaos", phase_chaos(cl, sys.argv[sys.argv.index("--delivery-id") + 1]
                                                  if "--delivery-id" in sys.argv else None)))
+
+    if args.phase in ("all", "money"):
+        results.append(("money", phase_money(args.drivers)))
 
     log("════════ SUMMARY ════════")
     for name, ok in results:

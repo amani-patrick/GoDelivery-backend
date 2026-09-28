@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -69,6 +70,7 @@ type DeliveryUsecase struct {
 	trustRepo        domain.TrustRepository    //nil when not wired
 	userRepo         domain.UserRepository
 	safetyRepo       domain.SafetyRepository
+	walletRepo       domain.WalletRepository   //nil when not wired (dev fallback)
 	pricing          *pricing.Engine
 	ledger           domain.LedgerRepository
 	redisClient      *redis.Client
@@ -92,6 +94,7 @@ func NewDeliveryUsecase(
 	trustRepo domain.TrustRepository,
 	userRepo domain.UserRepository,
 	safetyRepo domain.SafetyRepository,
+	walletRepo domain.WalletRepository,
 	pricingEngine *pricing.Engine,
 	ledger domain.LedgerRepository,
 	redisClient *redis.Client,
@@ -113,6 +116,7 @@ func NewDeliveryUsecase(
 		trustRepo:        trustRepo,
 		userRepo:         userRepo,
 		safetyRepo:       safetyRepo,
+		walletRepo:       walletRepo,
 		pricing:          pricingEngine,
 		ledger:           ledger,
 		redisClient:      redisClient,
@@ -312,8 +316,53 @@ func (uc *DeliveryUsecase) CreateDelivery(
 		UpdatedAt:           now,
 	}
 
-	if err := uc.repo.Create(ctx, d); err != nil {
-		return nil, err
+	// ── Order funding (escrow at creation) ─────────────────────────────────
+	// The fare is locked NOW and escrowed from the merchant wallet in the same
+	// transaction that inserts the delivery row. This guarantees the driver is
+	// payable the moment they confirm delivery, and prevents unfunded orders.
+	// With the wallet layer not wired (dev fallback), creation proceeds
+	// unfunded and payment degrades to the legacy outbox-only path.
+	if uc.walletRepo != nil {
+		fare := uc.pricing.CalculateFare(ctx, d)
+		d.FareRWF = fare
+		tx, txErr := uc.pool.Begin(ctx)
+		if txErr != nil {
+			return nil, fmt.Errorf("CreateDelivery: begin funding tx: %w", txErr)
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback(ctx)
+			}
+		}()
+		domainTx := wrapPgxTx(tx)
+		if err := uc.repo.CreateWithinTx(ctx, domainTx, d); err != nil {
+			return nil, err
+		}
+		if err := uc.walletRepo.HoldEscrowWithinTx(ctx, domainTx, in.MerchantID, d.ID, fare); err != nil {
+			if errors.Is(err, domain.ErrInsufficientFunds) {
+				uc.log.Warn("CreateDelivery: merchant wallet cannot fund order — rejected",
+					slog.String("merchant_id", in.MerchantID),
+					slog.Int64("fare_rwf", fare),
+				)
+				return nil, fmt.Errorf("%w: top up your wallet to place orders (fare: %d RWF)",
+					domain.ErrInsufficientFunds, fare)
+			}
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("CreateDelivery: commit funding tx: %w", err)
+		}
+		committed = true
+		uc.log.Info("order funded — fare escrowed at creation",
+			slog.String("delivery_id", d.ID),
+			slog.String("merchant_id", in.MerchantID),
+			slog.Int64("fare_rwf", fare),
+		)
+	} else {
+		if err := uc.repo.Create(ctx, d); err != nil {
+			return nil, err
+		}
 	}
 
 	//Write idempotency record to Redis
@@ -564,6 +613,7 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 	}
 
 	//  Weight fraud guard
+	persistWeight := false
 	if confirmedWeightKg > 0 && confirmedWeightKg != delivery.WeightKg {
 		// Fetch driver profile to check vehicle capacity against actual weight.
 		driverProfile, err := uc.driverRepo.GetByUserID(ctx, driverID)
@@ -585,21 +635,13 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 					deliveryID, delivery.WeightKg, confirmedWeightKg))
 			return domain.ErrWeightMismatch
 		}
-		// Weight is different but vehicle can still carry it — update the record.
-		if persistErr := uc.repo.UpdateConfirmedWeight(ctx, deliveryID, confirmedWeightKg); persistErr != nil {
-			uc.log.Warn("ConfirmPickup: UpdateConfirmedWeight failed — non-fatal",
-				slog.String("delivery_id", deliveryID),
-				slog.String("reason", persistErr.Error()),
-			)
-		}
+		// Weight is different but vehicle can still carry it — persist below,
+		// AFTER the state write (writing it here would bump updated_at and
+		// invalidate the optimistic lock used by repo.Update).
+		persistWeight = true
 	} else if confirmedWeightKg > 0 {
 		// still persist it for audit completeness.
-		if persistErr := uc.repo.UpdateConfirmedWeight(ctx, deliveryID, confirmedWeightKg); persistErr != nil {
-			uc.log.Warn("ConfirmPickup: UpdateConfirmedWeight failed — non-fatal",
-				slog.String("delivery_id", deliveryID),
-				slog.String("reason", persistErr.Error()),
-			)
-		}
+		persistWeight = true
 	}
 
 	prevState := delivery.CurrentState
@@ -614,6 +656,18 @@ func (uc *DeliveryUsecase) ConfirmPickup(ctx context.Context, deliveryID, driver
 
 	if err := uc.repo.Update(ctx, delivery); err != nil {
 		return err
+	}
+
+	// Persist the confirmed weight AFTER the state write — the dedicated
+	// column update must never interleave with the optimistic-locked state
+	// write above (it bumps updated_at and would zero-row the next Update).
+	if persistWeight {
+		if persistErr := uc.repo.UpdateConfirmedWeight(ctx, deliveryID, confirmedWeightKg); persistErr != nil {
+			uc.log.Warn("ConfirmPickup: UpdateConfirmedWeight failed — non-fatal",
+				slog.String("delivery_id", deliveryID),
+				slog.String("reason", persistErr.Error()),
+			)
+		}
 	}
 
 	// ── "Merchant Lied" Protection Gate ────────────────────────────────
@@ -681,6 +735,35 @@ func (uc *DeliveryUsecase) ConfirmDelivery(ctx context.Context, deliveryID, driv
 		if err := uc.confirmDeliveryWithOutbox(ctx, delivery, prevState); err != nil {
 			return err
 		}
+	} else if uc.walletRepo != nil {
+		// No outbox configured but wallet layer present: still pay the driver
+		// atomically with the state change (dev fallback without payment rails).
+		tx, txErr := uc.pool.Begin(ctx)
+		if txErr != nil {
+			return fmt.Errorf("ConfirmDelivery: begin payout tx: %w", txErr)
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback(ctx)
+			}
+		}()
+		domainTx := wrapPgxTx(tx)
+		if err := uc.repo.UpdateWithinTx(ctx, domainTx, delivery); err != nil {
+			return err
+		}
+		fare := delivery.FareRWF
+		if fare <= 0 {
+			fare = uc.pricing.CalculateFare(ctx, delivery)
+		}
+		if err := uc.walletRepo.ReleaseEscrowWithinTx(ctx, domainTx,
+			delivery.MerchantID, delivery.DriverID, delivery.ID, fare); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("ConfirmDelivery: commit payout tx: %w", err)
+		}
+		committed = true
 	} else {
 		uc.log.Warn("ConfirmDelivery: outbox not configured — using plain update (payment not guaranteed)",
 			slog.String("delivery_id", deliveryID),
@@ -789,6 +872,27 @@ func (uc *DeliveryUsecase) recordWaitBountyIfLate(
 		slog.Float64("wait_min", bounty.WaitMinutes),
 		slog.Float64("bounty_rwf", bounty.BountyRWF),
 	)
+
+	// Move the money instantly: merchant wallet → driver wallet, with paired
+	// ledger entries. Failures never block the pickup — the bounty row is
+	// already persisted and can be re-settled by an ops job.
+	if uc.walletRepo != nil {
+		bountyRWF := int64(bounty.BountyRWF)
+		if err := uc.walletRepo.PayWaitBounty(ctx,
+			bounty.MerchantID, bounty.DriverID, bounty.DeliveryID, bountyRWF); err != nil {
+			uc.log.Error("wait bounty transfer failed — row persisted for re-settlement",
+				slog.String("delivery_id", bounty.DeliveryID),
+				slog.String("reason", err.Error()),
+			)
+		} else {
+			uc.log.Info("wait bounty paid instantly",
+				slog.String("delivery_id", bounty.DeliveryID),
+				slog.String("driver_id", bounty.DriverID),
+				slog.Int64("bounty_rwf", bountyRWF),
+			)
+		}
+	}
+
 	uc.appendAudit(ctx, delivery.ID, "SYSTEM", "MERCHANT_WAIT_BOUNTY",
 		"", "",
 		fmt.Sprintf("wait=%.1fmin bounty=%.0fRWF merchant=%s",
@@ -880,10 +984,22 @@ func (uc *DeliveryUsecase) confirmDeliveryWithOutbox(
 
 	// Insert payment outbox event inside the same transaction
 	// AmountRWF is 0 here — the actual fare calculation will be implemented
-	// when the pricing service is wired in. The worker will skip events with
-	// amount = 0 and re-queue them until pricing is resolved.
-	fare := uc.pricing.CalculateFare(ctx, delivery)
-	
+	// The outbox event records the payout INTENT for external rails (MoMo
+	// later). The internal ledger payment itself is settled right here via the
+	// wallet layer: escrow → driver (net) + platform (commission), in THIS
+	// same transaction. The outbox worker then only handles the external
+	// disbursement, never double-crediting the wallet.
+	fare := delivery.FareRWF
+	if fare <= 0 {
+		// Legacy rows created before fare persistence — compute now.
+		fare = uc.pricing.CalculateFare(ctx, delivery)
+	}
+	if uc.walletRepo != nil {
+		if err := uc.walletRepo.ReleaseEscrowWithinTx(ctx, domainTx,
+			delivery.MerchantID, delivery.DriverID, delivery.ID, fare); err != nil {
+			return fmt.Errorf("ConfirmDelivery: escrow release: %w", err)
+		}
+	}
 	recipientPhone := ""
 	if driverUser, err := uc.userRepo.GetByID(ctx, delivery.DriverID); err == nil && driverUser != nil {
 		recipientPhone = driverUser.Phone
@@ -1139,6 +1255,11 @@ type pgxTxWrapper struct{ inner pgx.Tx }
 func (w *pgxTxWrapper) Exec(ctx context.Context, sql string, args ...interface{}) error {
 	_, err := w.inner.Exec(ctx, sql, args...)
 	return err
+}
+
+// ExecTag returns the pgx command tag so callers can inspect RowsAffected.
+func (w *pgxTxWrapper) ExecTag(ctx context.Context, sql string, args ...interface{}) (domain.CommandTag, error) {
+	return w.inner.Exec(ctx, sql, args...)
 }
 
 // wrapPgxTx converts a pgx.Tx into the domain.Tx abstraction.

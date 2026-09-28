@@ -137,9 +137,16 @@ func (s *SpatialIndex) UpdateDriverPosition(ctx context.Context, frame domain.Te
 // Returns an empty (non-nil) slice when no frames exist.
 func (s *SpatialIndex) GetRecentFrames(ctx context.Context, driverID string, n int) ([]domain.TelemetryFrame, error) {
 	bufKey := frameBufferPrefix + driverID
-	// Fetch up to maxBufferLen entries regardless of n so sorting is over the
-	// full available history. The caller then receives the n newest.
-	raw, err := s.rdb.LRange(ctx, bufKey, 0, maxBufferLen-1).Result()
+	// Fetch only what the caller needs (capped at the buffer length). The
+	// anomaly detector runs on EVERY telemetry frame — pulling all 100 buffer
+	// entries per frame and discarding all but n cost ~3x more Redis bandwidth
+	// and JSON decodes, which showed up as a CPU cliff at ~1200 concurrent
+	// drivers in load testing.
+	end := maxBufferLen - 1
+	if n > 0 && n-1 < end {
+		end = n - 1
+	}
+	raw, err := s.rdb.LRange(ctx, bufKey, 0, int64(end)).Result()
 	if err != nil {
 		return nil, fmt.Errorf("get recent frames: %w", err)
 	}
@@ -289,6 +296,14 @@ type AnomalyDetector struct {
 	spatial    *SpatialIndex
 	thresholds domain.AnomalyThresholds
 	alertCh    chan<- domain.AnomalyAlert
+	// analysisSem bounds concurrent Analyse calls. One goroutine per frame is
+	// unbounded fan-out: at ~400 frames/s the load test spawned hundreds of
+	// simultaneous analyses (each an LRANGE + JSON decode) and the CPU cliff
+	// at ~1200 concurrent drivers followed. Frames arriving while the
+	// semaphore is full are skipped — anomaly analysis is best-effort (the
+	// synchronous pre-write velocity gate in handleFrame still enforces hard
+	// spoof rejection), and the next frame from the same driver re-analyses.
+	analysisSem chan struct{}
 	log        *slog.Logger
 }
 
@@ -301,10 +316,11 @@ func NewAnomalyDetector(
 	log *slog.Logger,
 ) *AnomalyDetector {
 	return &AnomalyDetector{
-		spatial:    spatial,
-		thresholds: thresholds,
-		alertCh:    alertCh,
-		log:        log,
+		spatial:     spatial,
+		thresholds:  thresholds,
+		alertCh:     alertCh,
+		analysisSem: make(chan struct{}, 256),
+		log:         log,
 	}
 }
 
@@ -313,7 +329,18 @@ func NewAnomalyDetector(
 // Because GetRecentFrames now sorts by CapturedAt, all checks operate on a
 // chronologically consistent slice even after a dead-zone reconnect burst.
 func (d *AnomalyDetector) Analyse(ctx context.Context, frame domain.TelemetryFrame) {
-	frames, err := d.spatial.GetRecentFrames(ctx, frame.DriverID, d.thresholds.PanicBufferSize)
+	select {
+	case d.analysisSem <- struct{}{}:
+		defer func() { <-d.analysisSem }()
+	default:
+		return // analyser saturated — skip this frame (see analysisSem doc)
+	}
+
+	need := d.thresholds.PanicBufferSize
+	if need < 2 {
+		need = 2
+	}
+	frames, err := d.spatial.GetRecentFrames(ctx, frame.DriverID, need)
 	if err != nil || len(frames) < 2 {
 		return
 	}

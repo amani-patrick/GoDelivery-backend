@@ -128,6 +128,12 @@ type Delivery struct {
 	PrepTimeMinutes int       `json:"prep_time_minutes"`
 	ReadyAt         time.Time `json:"ready_at"`
 
+	// FareRWF is the gross fare locked at creation time and escrowed from the
+	// merchant wallet in the same transaction that inserts this row. Written
+	// once at creation — never mutated (the invoice worker and escrow release
+	// both read it).
+	FareRWF int64 `json:"fare_rwf"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -181,6 +187,10 @@ func (d *Delivery) IsTerminal() bool {
 // DeliveryRepository is the persistence contract for the Delivery aggregate.
 type DeliveryRepository interface {
 	Create(ctx context.Context, d *Delivery) error
+	// CreateWithinTx inserts the delivery inside the caller's transaction so
+	// the row and its wallet escrow (order funding) commit atomically: an
+	// order can never exist unfunded, and funding can never orphan an order.
+	CreateWithinTx(ctx context.Context, tx Tx, d *Delivery) error
 	GetByID(ctx context.Context, id string) (*Delivery, error)
 	Update(ctx context.Context, d *Delivery) error
 	UpdateWithinTx(ctx context.Context, tx Tx, d *Delivery) error

@@ -75,9 +75,22 @@ type AuthResult struct {
 
 // Register creates a new user account. The plaintext password is hashed with
 // bcrypt before any persistence call. The hash cost is injected from config.
+//
+// RBAC: privileged roles (ADMIN, DISPATCHER) can never be self-registered —
+// they are provisioned internally (seed script / by an existing ADMIN via the
+// future user-management ops). This closes the privilege-escalation hole
+// where anyone could POST role=ADMIN to /auth/register.
 func (uc *AuthUsecase) Register(ctx context.Context, in RegisterInput) (*AuthResult, error) {
 	if !in.Role.IsValid() {
 		return nil, fmt.Errorf("%w: unknown role %q", domain.ErrInvalidInput, in.Role)
+	}
+	switch in.Role {
+	case domain.RoleAdmin, domain.RoleDispatcher:
+		uc.log.Warn("blocked privileged self-registration",
+			slog.String("phone", in.Phone),
+			slog.String("requested_role", string(in.Role)),
+		)
+		return nil, fmt.Errorf("%w: role %q cannot be self-registered", domain.ErrUnauthorized, in.Role)
 	}
 
 	// Check uniqueness before hashing to avoid wasted bcrypt work on conflict.

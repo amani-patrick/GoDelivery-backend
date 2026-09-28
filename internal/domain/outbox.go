@@ -75,10 +75,20 @@ type OutboxRepository interface {
 	ScheduleRetry(ctx context.Context, id string, nextRetryAt time.Time) error
 }
 
+// CommandTag is the minimal view of a Postgres command result. pgconn.CommandTag
+// satisfies it implicitly, keeping the domain layer free of driver imports.
+type CommandTag interface {
+	RowsAffected() int64
+}
+
 // Tx is an abstraction over a database transaction handle. The concrete
 // implementation wraps pgx.Tx. Defined here in the domain layer so the
 // OutboxRepository interface remains infrastructure-agnostic.
 type Tx interface {
 	// Exec runs a parameterised SQL statement inside the transaction.
 	Exec(ctx context.Context, sql string, args ...interface{}) error
+	// ExecTag runs a statement and reports how many rows it affected —
+	// required by wallet escrow moves, where "0 rows affected" is the
+// insufficient-balance signal rather than an error.
+	ExecTag(ctx context.Context, sql string, args ...interface{}) (CommandTag, error)
 }

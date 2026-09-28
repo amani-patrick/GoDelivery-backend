@@ -39,6 +39,7 @@ import (
 	"github.com/umurinzi/backend/internal/pricing"
 	"github.com/umurinzi/backend/internal/surge"
 	"github.com/umurinzi/backend/internal/tracking"
+	"github.com/umurinzi/backend/internal/wallet"
 )
 
 // decayInterval controls how often the danger zone threat level is reduced.
@@ -182,6 +183,13 @@ func main() {
 	surgeEngine := surge.NewEngine(pool, log)
 
 	// ── 8. Application usecases ───────────────────────────────────────────────
+	// Wallet layer: ledger-backed balances, instant self-service cashout, and
+	// escrow-funded orders. The payout provider is a STUB until MTN MoMo is
+	// integrated — swap the binding below; no other call-site changes.
+	walletRepo := wallet.NewPostgresRepo(pool, log)
+	walletPayouts := wallet.NewStubPayoutProvider(log) // TODO: replace with MoMo Disbursements
+	walletUC := wallet.NewUsecase(walletRepo, walletPayouts, log)
+
 	authCfg := deliveryuc.AuthConfig{
 		JWTSecret:   cfg.Auth.JWTSecret,
 		ExpiryHours: cfg.Auth.JWTExpiryHours,
@@ -206,6 +214,7 @@ func main() {
 		trustRepo,
 		userRepo,
 		safetyRepo,
+		walletRepo,
 		pricing.NewEngine(surgeEngine),
 		auditLedger,
 		rdb,
@@ -222,7 +231,7 @@ func main() {
 	)
 
 	// ── 9. HTTP handler + router ──────────────────────────────────────────────
-	deliveryHandler := delivery.NewHandler(deliveryUC, authUC, driverUC, log)
+	deliveryHandler := delivery.NewHandler(deliveryUC, authUC, driverUC, walletUC, log)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RealIP)

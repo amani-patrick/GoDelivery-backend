@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/umurinzi/backend/internal/delivery/usecase"
 	"github.com/umurinzi/backend/internal/domain"
 	"github.com/umurinzi/backend/internal/middleware"
+	"github.com/umurinzi/backend/internal/wallet"
 )
 
 // Operation routing: the handler reads operationName from the JSON request body.
@@ -48,6 +50,7 @@ type Handler struct {
 	deliveryUC *usecase.DeliveryUsecase
 	authUC     *usecase.AuthUsecase
 	driverUC   *usecase.DriverUsecase
+	walletUC   *wallet.Usecase
 	log        *slog.Logger
 }
 
@@ -55,12 +58,14 @@ func NewHandler(
 	deliveryUC *usecase.DeliveryUsecase,
 	authUC *usecase.AuthUsecase,
 	driverUC *usecase.DriverUsecase,
+	walletUC *wallet.Usecase,
 	log *slog.Logger,
 ) *Handler {
 	return &Handler{
 		deliveryUC: deliveryUC,
 		authUC:     authUC,
 		driverUC:   driverUC,
+		walletUC:   walletUC,
 		log:        log,
 	}
 }
@@ -167,6 +172,20 @@ func (h *Handler) route(ctx context.Context, req graphQLRequest) (any, error) {
 	//Customer profile 
 	case "UpdateCustomerLocation":
 		return h.resolveUpdateCustomerLocation(ctx, vars)
+
+	//Wallet & earnings
+	case "MyWallet":
+		return h.resolveMyWallet(ctx)
+	case "MyEarnings":
+		return h.resolveMyEarnings(ctx, vars)
+	case "TopUpWallet":
+		return h.resolveTopUpWallet(ctx, vars)
+	case "RequestCashout":
+		return h.resolveRequestCashout(ctx, vars)
+	case "MyCashouts":
+		return h.resolveMyCashouts(ctx)
+	case "PlatformStats":
+		return h.resolvePlatformStats(ctx)
 
 	default:
 		return nil, fmt.Errorf("unknown operation: %q", req.OpName)
@@ -605,6 +624,163 @@ func (h *Handler) requireAuth(ctx context.Context) (string, error) {
 	return userID, nil
 }
 
+	//Wallet resolvers
+
+func (h *Handler) resolveMyWallet(ctx context.Context) (any, error) {
+	callerID, err := h.requireAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if h.walletUC == nil {
+		return nil, fmt.Errorf("wallet service not available")
+	}
+	w, err := h.walletUC.MyWallet(ctx, callerID)
+	if err != nil {
+		return nil, err
+	}
+	return marshalWallet(w), nil
+}
+
+func (h *Handler) resolveMyEarnings(ctx context.Context, vars map[string]any) (any, error) {
+	callerID, err := h.requireAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if h.walletUC == nil {
+		return nil, fmt.Errorf("wallet service not available")
+	}
+	period := stringOrEmpty(vars, "period")
+	if period == "" {
+		period = "today"
+	}
+	s, err := h.walletUC.MyEarnings(ctx, callerID, period)
+	if err != nil {
+		return nil, err
+	}
+	return marshalSummary(s), nil
+}
+
+// resolveTopUpWallet credits the caller's wallet via the stubbed external
+// rails. When a real gateway exists, its verified webhook calls the same
+// usecase method with a transaction reference.
+func (h *Handler) resolveTopUpWallet(ctx context.Context, vars map[string]any) (any, error) {
+	callerID, err := h.requireAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if h.walletUC == nil {
+		return nil, fmt.Errorf("wallet service not available")
+	}
+	amount := int64From(vars, "amountRwf")
+	w, err := h.walletUC.TopUp(ctx, callerID, amount)
+	if err != nil {
+		return nil, err
+	}
+	return marshalWallet(w), nil
+}
+
+// resolveRequestCashout performs an INSTANT self-service withdrawal: the
+// wallet is debited and the payout fires immediately (stub rails for now).
+// There is no admin approval queue — funds in the wallet belong to the user.
+func (h *Handler) resolveRequestCashout(ctx context.Context, vars map[string]any) (any, error) {
+	callerID, err := h.requireAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if h.walletUC == nil {
+		return nil, fmt.Errorf("wallet service not available")
+	}
+	input, err := requireInputMap(vars)
+	if err != nil {
+		return nil, err
+	}
+	amount := int64From(input, "amountRwf")
+	phone := requireString(input, "phone")
+	c, err := h.walletUC.RequestCashout(ctx, callerID, phone, amount)
+	if err != nil {
+		return nil, err
+	}
+	return marshalCashout(c), nil
+}
+
+func (h *Handler) resolveMyCashouts(ctx context.Context) (any, error) {
+	callerID, err := h.requireAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if h.walletUC == nil {
+		return nil, fmt.Errorf("wallet service not available")
+	}
+	cashouts, err := h.walletUC.MyCashouts(ctx, callerID, 50)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(cashouts))
+	for _, c := range cashouts {
+		out = append(out, marshalCashout(c))
+	}
+	return out, nil
+}
+
+// resolvePlatformStats exposes the platform money-flow view (commission,
+// escrow float, payout exposure) to ADMIN callers only.
+func (h *Handler) resolvePlatformStats(ctx context.Context) (any, error) {
+	callerID, err := h.requireAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if h.walletUC == nil {
+		return nil, fmt.Errorf("wallet service not available")
+	}
+	role, _ := ctx.Value(middleware.CtxUserRole).(string)
+	if role != string(domain.RoleAdmin) {
+		return nil, domain.ErrUnauthorized
+	}
+	s, err := h.walletUC.PlatformStats(ctx, callerID)
+	if err != nil {
+		return nil, err
+	}
+	return marshalSummary(s), nil
+}
+
+//Wallet marshal helpers
+
+func marshalWallet(w *domain.Wallet) map[string]any {
+	return map[string]any{
+		"userId":     w.UserID,
+		"balanceRwf": w.BalanceRWF,
+		"escrowRwf":  w.EscrowRWF,
+		"updatedAt":  w.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+func marshalSummary(s *domain.WalletSummary) map[string]any {
+	return map[string]any{
+		"period":         s.Period,
+		"tripsCompleted": s.TripsCompleted,
+		"grossRwf":       s.GrossRWF,
+		"commissionRwf":  s.CommissionRWF,
+		"netRwf":         s.NetRWF,
+		"bountyRwf":      s.BountyRWF,
+		"spentRwf":       s.SpentRWF,
+	}
+}
+
+func marshalCashout(c *domain.CashoutRequest) map[string]any {
+	return map[string]any{
+		"id":            c.ID,
+		"userId":        c.UserID,
+		"amountRwf":     c.AmountRWF,
+		"phone":         c.Phone,
+		"provider":      c.Provider,
+		"status":        c.Status,
+		"providerRef":   c.ProviderRef,
+		"failureReason": c.FailureReason,
+		"createdAt":     c.CreatedAt.Format(time.RFC3339),
+		"updatedAt":     c.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
 //Error classification 
 
 func (h *Handler) classifyError(err error) map[string]any {
@@ -638,6 +814,12 @@ func (h *Handler) classifyError(err error) map[string]any {
 		ext["code"] = "STACK_NOT_FEASIBLE"
 	case errors.Is(err, domain.ErrActorBanned):
 		ext["code"] = "ACTOR_BANNED"
+	case errors.Is(err, domain.ErrInsufficientFunds):
+		ext["code"] = "INSUFFICIENT_FUNDS"
+	case errors.Is(err, domain.ErrCashoutTooLarge), errors.Is(err, domain.ErrCashoutTooSmall):
+		ext["code"] = "CASHOUT_INVALID_AMOUNT"
+	case errors.Is(err, domain.ErrPayoutProvider):
+		ext["code"] = "PAYOUT_FAILED"
 	case errors.Is(err, domain.ErrInvalidInput):
 		ext["code"] = "INVALID_INPUT"
 	default:
@@ -683,6 +865,8 @@ func marshalDelivery(d *domain.Delivery) map[string]any {
 		},
 		"description": d.Description,
 		"weightKg":    d.WeightKg,
+		"fareRwf":     d.FareRWF,
+		"prepTimeMinutes": d.PrepTimeMinutes,
 		"createdAt":   d.CreatedAt.Format(time.RFC3339),
 		"updatedAt":   d.UpdatedAt.Format(time.RFC3339),
 	}
@@ -694,6 +878,28 @@ func marshalDeliveries(ds []*domain.Delivery) []map[string]any {
 		out[i] = marshalDelivery(d)
 	}
 	return out
+}
+
+func int64From(m map[string]any, key string) int64 {
+	if m == nil {
+		return 0
+	}
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v)
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	case string:
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	default:
+		return 0
+	}
 }
 
 func marshalUser(u *domain.User) map[string]any {

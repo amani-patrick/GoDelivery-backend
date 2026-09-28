@@ -50,7 +50,7 @@ func (r *DeliveryPostgresRepo) Create(ctx context.Context, d *domain.Delivery) e
 			confirmed_weight_kg, priority_level,
 			stack_group_id, stack_sequence,
 			prep_time_minutes, ready_at,
-			created_at, updated_at
+			fare_rwf, created_at, updated_at
 		) VALUES (
 			$1,  $2,  $3,  $4,  $5,
 			$6,  $7,
@@ -61,7 +61,7 @@ func (r *DeliveryPostgresRepo) Create(ctx context.Context, d *domain.Delivery) e
 			$16, $17,
 			$18, $19,
 			$20, $21,
-			$22, $23
+			$22, $23, $24
 		)`
 
 	_, err := r.pool.Exec(ctx, q,
@@ -86,6 +86,7 @@ func (r *DeliveryPostgresRepo) Create(ctx context.Context, d *domain.Delivery) e
 		d.StackSequence,
 		d.PrepTimeMinutes,
 		d.ReadyAt,
+		d.FareRWF,
 		d.CreatedAt,
 		d.UpdatedAt,
 	)
@@ -96,6 +97,70 @@ func (r *DeliveryPostgresRepo) Create(ctx context.Context, d *domain.Delivery) e
 			slog.String("reason", err.Error()),
 		)
 		return fmt.Errorf("create delivery: %w", err)
+	}
+	return nil
+}
+
+// CreateWithinTx inserts the delivery inside the caller's transaction so the
+// row and the merchant's wallet escrow commit atomically (order funding).
+func (r *DeliveryPostgresRepo) CreateWithinTx(ctx context.Context, tx domain.Tx, d *domain.Delivery) error {
+	const q = `
+		INSERT INTO deliveries (
+			id, merchant_id, driver_id, customer_id, current_state,
+			pickup_qr_code, delivery_pin,
+			pickup_lat,  pickup_lng,
+			dropoff_lat, dropoff_lng,
+			description, weight_kg,
+			vehicle_type_required, package_category,
+			confirmed_weight_kg, priority_level,
+			stack_group_id, stack_sequence,
+			prep_time_minutes, ready_at,
+			fare_rwf, created_at, updated_at
+		) VALUES (
+			$1,  $2,  $3,  $4,  $5,
+			$6,  $7,
+			$8,  $9,
+			$10, $11,
+			$12, $13,
+			$14, $15,
+			$16, $17,
+			$18, $19,
+			$20, $21,
+			$22, $23, $24
+		)`
+
+	if err := tx.Exec(ctx, q,
+		d.ID,
+		d.MerchantID,
+		nullableString(d.DriverID),
+		d.CustomerID,
+		string(d.CurrentState),
+		d.PickupQRCode,
+		d.DeliveryPIN,
+		d.PickupLoc.Lat,
+		d.PickupLoc.Lng,
+		d.DropoffLoc.Lat,
+		d.DropoffLoc.Lng,
+		d.Description,
+		d.WeightKg,
+		string(d.VehicleTypeRequired),
+		string(d.PackageCategory),
+		d.ConfirmedWeightKg,
+		d.PriorityLevel,
+		nullableString(d.StackGroupID),
+		d.StackSequence,
+		d.PrepTimeMinutes,
+		d.ReadyAt,
+		d.FareRWF,
+		d.CreatedAt,
+		d.UpdatedAt,
+	); err != nil {
+		r.log.Error("delivery.repo.CreateWithinTx failed",
+			slog.String("delivery_id", d.ID),
+			slog.String("merchant_id", d.MerchantID),
+			slog.String("reason", err.Error()),
+		)
+		return fmt.Errorf("create delivery in tx: %w", err)
 	}
 	return nil
 }
@@ -114,7 +179,7 @@ func (r *DeliveryPostgresRepo) GetByID(ctx context.Context, id string) (*domain.
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
 			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
-			created_at, updated_at
+			fare_rwf, created_at, updated_at
 		FROM deliveries
 		WHERE id = $1`
 
@@ -229,7 +294,7 @@ func (r *DeliveryPostgresRepo) ListByDriver(
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
 			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
-			created_at, updated_at
+			fare_rwf, created_at, updated_at
 		FROM deliveries
 		WHERE driver_id = $1 AND current_state = ANY($2::text[])
 		ORDER BY stack_sequence ASC, created_at DESC`
@@ -252,7 +317,7 @@ func (r *DeliveryPostgresRepo) ListByMerchant(
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
 			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
-			created_at, updated_at
+			fare_rwf, created_at, updated_at
 		FROM deliveries
 		WHERE merchant_id = $1 AND current_state = ANY($2::text[])
 		ORDER BY created_at DESC`
@@ -274,7 +339,7 @@ func (r *DeliveryPostgresRepo) ListActiveByDriver(ctx context.Context, driverID 
 			confirmed_weight_kg, priority_level,
 			COALESCE(stack_group_id, ''), stack_sequence,
 			prep_time_minutes, COALESCE(ready_at, '0001-01-01'::timestamptz),
-			created_at, updated_at
+			fare_rwf, created_at, updated_at
 		FROM deliveries
 		WHERE driver_id = $1
 		  AND current_state IN ('ASSIGNED','IN_TRANSIT')
@@ -409,6 +474,7 @@ func scanDelivery(row scannable) (*domain.Delivery, error) {
 		&d.StackSequence,
 		&d.PrepTimeMinutes,
 		&d.ReadyAt,
+		&d.FareRWF,
 		&d.CreatedAt,
 		&d.UpdatedAt,
 	)
